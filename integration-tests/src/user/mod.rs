@@ -27,27 +27,6 @@ pub mod runtime_user;
 
 const POISONED_LOCK_ERR: &str = "The lock was poisoned.";
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum CommitError {
-    Server(ServerError),
-    OutcomeNotFound,
-}
-
-impl std::error::Error for CommitError {}
-impl std::fmt::Display for CommitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CommitError::Server(s) => f.write_fmt(format_args!(
-                "server error occurred while committing a transaction: {}",
-                s
-            )),
-            CommitError::OutcomeNotFound => {
-                f.write_str("transaction outcome not found while committing it (tx invalid...)")
-            }
-        }
-    }
-}
-
 pub trait User {
     fn view_account(&self, account_id: &AccountId) -> Result<AccountView, String>;
 
@@ -74,7 +53,7 @@ pub trait User {
     fn commit_transaction(
         &self,
         signed_transaction: SignedTransaction,
-    ) -> Result<FinalExecutionOutcomeView, CommitError>;
+    ) -> Result<FinalExecutionOutcomeView, ServerError>;
 
     fn add_receipts(
         &self,
@@ -99,7 +78,7 @@ pub trait User {
 
     fn get_transaction_result(&self, hash: &CryptoHash) -> Option<ExecutionOutcomeView>;
 
-    fn get_transaction_final_result(&self, hash: &CryptoHash) -> Option<FinalExecutionOutcomeView>;
+    fn get_transaction_final_result(&self, hash: &CryptoHash) -> FinalExecutionOutcomeView;
 
     fn get_state_root(&self) -> CryptoHash;
 
@@ -118,7 +97,7 @@ pub trait User {
         signer_id: AccountId,
         receiver_id: AccountId,
         actions: Vec<Action>,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         let block_hash = self.get_best_block_hash().unwrap_or_default();
         let signed_transaction = SignedTransaction::from_actions(
             self.get_access_key_nonce_for_signer(&signer_id).unwrap_or_default() + 1,
@@ -137,7 +116,7 @@ pub trait User {
         signer_id: AccountId,
         receiver_id: AccountId,
         amount: Balance,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         self.sign_and_commit_actions(
             signer_id,
             receiver_id,
@@ -149,7 +128,7 @@ pub trait User {
         &self,
         signer_id: AccountId,
         code: Vec<u8>,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         self.sign_and_commit_actions(
             signer_id.clone(),
             signer_id,
@@ -165,7 +144,7 @@ pub trait User {
         args: Vec<u8>,
         gas: Gas,
         deposit: Balance,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         self.sign_and_commit_actions(
             signer_id,
             contract_id,
@@ -184,7 +163,7 @@ pub trait User {
         new_account_id: AccountId,
         public_key: PublicKey,
         amount: Balance,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         self.sign_and_commit_actions(
             signer_id,
             new_account_id,
@@ -204,7 +183,7 @@ pub trait User {
         signer_id: AccountId,
         public_key: PublicKey,
         access_key: AccessKey,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         self.sign_and_commit_actions(
             signer_id.clone(),
             signer_id,
@@ -216,7 +195,7 @@ pub trait User {
         &self,
         signer_id: AccountId,
         public_key: PublicKey,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         self.sign_and_commit_actions(
             signer_id.clone(),
             signer_id,
@@ -230,7 +209,7 @@ pub trait User {
         old_public_key: PublicKey,
         new_public_key: PublicKey,
         access_key: AccessKey,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         self.sign_and_commit_actions(
             signer_id.clone(),
             signer_id,
@@ -246,7 +225,7 @@ pub trait User {
         signer_id: AccountId,
         receiver_id: AccountId,
         beneficiary_id: AccountId,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         self.sign_and_commit_actions(
             signer_id,
             receiver_id,
@@ -258,7 +237,7 @@ pub trait User {
         &self,
         signer_id: AccountId,
         receiver_id: AccountId,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         self.delete_account_with_beneficiary_set(signer_id.clone(), receiver_id, signer_id)
     }
 
@@ -267,7 +246,7 @@ pub trait User {
         signer_id: AccountId,
         public_key: PublicKey,
         stake: Balance,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         self.sign_and_commit_actions(
             signer_id.clone(),
             signer_id,
@@ -285,7 +264,7 @@ pub trait User {
         receiver_id: AccountId,
         relayer_id: AccountId,
         actions: Vec<Action>,
-    ) -> Result<FinalExecutionOutcomeView, CommitError> {
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
         let inner_signer = create_user_test_signer(&signer_id);
         let user_nonce = self
             .get_access_key(&signer_id, &inner_signer.public_key)

@@ -15,8 +15,7 @@ workspace = true
 [dependencies]
 wat.workspace = true
 wasm-encoder.workspace = true
-wasmprinter.workspace = true
-wasm-smith = { workspace = true, features = ["wasmparser"] }
+wasm-smith.workspace = true
 rand = { workspace = true, features = ["small_rng"] }
 arbitrary.workspace = true
 

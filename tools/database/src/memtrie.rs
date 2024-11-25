@@ -46,8 +46,7 @@ impl LoadMemTrieCommand {
         let block_header = store
             .get_ser::<BlockHeader>(DBCol::BlockHeader, &borsh::to_vec(&head).unwrap())?
             .ok_or_else(|| anyhow::anyhow!("Block header not found"))?;
-        let epoch_manager =
-            EpochManager::new_arc_handle(store.clone(), &genesis_config, Some(home));
+        let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis_config);
 
         let all_shard_uids: Vec<ShardUId> =
             epoch_manager.get_shard_layout(block_header.epoch_id()).unwrap().shard_uids().collect();
@@ -65,11 +64,9 @@ impl LoadMemTrieCommand {
 
         println!("Loading memtries for shards {:?}...", selected_shard_uids);
         let start_time = std::time::Instant::now();
-        runtime.get_tries().load_mem_tries_for_enabled_shards(
-            &selected_shard_uids,
-            &[].into(),
-            !self.no_parallel,
-        )?;
+        runtime
+            .get_tries()
+            .load_mem_tries_for_enabled_shards(&selected_shard_uids, !self.no_parallel)?;
         println!(
             "Finished loading memtries, took {:?}, press Ctrl-C to exit.",
             start_time.elapsed()

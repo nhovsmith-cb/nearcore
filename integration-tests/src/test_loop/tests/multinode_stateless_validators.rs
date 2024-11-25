@@ -23,7 +23,7 @@ const NUM_CHUNK_VALIDATORS_ONLY: usize = 4;
 const NUM_VALIDATORS: usize = NUM_BLOCK_AND_CHUNK_PRODUCERS + NUM_CHUNK_VALIDATORS_ONLY;
 
 #[test]
-fn slow_test_stateless_validators_with_multi_test_loop() {
+fn test_stateless_validators_with_multi_test_loop() {
     init_test_logger();
     let builder = TestLoopBuilder::new();
 
@@ -56,10 +56,10 @@ fn slow_test_stateless_validators_with_multi_test_loop() {
     for account in &accounts {
         genesis_builder.add_user_account_simple(account.clone(), initial_balance);
     }
-    let (genesis, epoch_config_store) = genesis_builder.build();
+    let genesis = genesis_builder.build();
 
     let TestLoopEnv { mut test_loop, datas: node_datas, tempdir } =
-        builder.genesis(genesis).epoch_config_store(epoch_config_store).clients(clients).build();
+        builder.genesis(genesis).clients(clients).build();
 
     // Capture the initial validator info in the first epoch.
     let client_handle = node_datas[0].client_sender.actor_handle();
@@ -67,7 +67,7 @@ fn slow_test_stateless_validators_with_multi_test_loop() {
     let initial_epoch_id = chain.head().unwrap().epoch_id;
 
     let non_validator_accounts = accounts.iter().skip(NUM_VALIDATORS).cloned().collect_vec();
-    execute_money_transfers(&mut test_loop, &node_datas, &non_validator_accounts).unwrap();
+    execute_money_transfers(&mut test_loop, &node_datas, &non_validator_accounts);
 
     // Capture the id of the epoch we will check for the correct validator information in assert_validator_info.
     let prev_epoch_id = test_loop.data.get(&client_handle).client.chain.head().unwrap().epoch_id;

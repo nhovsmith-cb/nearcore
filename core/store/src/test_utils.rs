@@ -1,6 +1,7 @@
-use crate::adapter::{StoreAdapter, StoreUpdateAdapter};
 use crate::db::TestDB;
-use crate::flat::{BlockInfo, FlatStorageManager, FlatStorageReadyStatus, FlatStorageStatus};
+use crate::flat::{
+    store_helper, BlockInfo, FlatStorageManager, FlatStorageReadyStatus, FlatStorageStatus,
+};
 use crate::metadata::{DbKind, DbVersion, DB_VERSION};
 use crate::{
     get, get_delayed_receipt_indices, get_promise_yield_indices, DBCol, NodeStorage, ShardTries,
@@ -8,15 +9,14 @@ use crate::{
 };
 use itertools::Itertools;
 use near_primitives::account::id::AccountId;
-use near_primitives::bandwidth_scheduler::BandwidthRequests;
 use near_primitives::congestion_info::CongestionInfo;
 use near_primitives::hash::CryptoHash;
 use near_primitives::receipt::{DataReceipt, PromiseYieldTimeout, Receipt, ReceiptEnum, ReceiptV1};
-use near_primitives::shard_layout::{get_block_shard_uid, ShardLayout, ShardUId};
+use near_primitives::shard_layout::{get_block_shard_uid, ShardUId, ShardVersion};
 use near_primitives::state::FlatStateValue;
 use near_primitives::trie_key::TrieKey;
 use near_primitives::types::chunk_extra::ChunkExtra;
-use near_primitives::types::StateRoot;
+use near_primitives::types::{NumShards, StateRoot};
 use near_primitives::version::{ProtocolFeature, PROTOCOL_VERSION};
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -77,7 +77,8 @@ pub fn create_test_split_store() -> (Store, Store) {
 
 pub struct TestTriesBuilder {
     store: Option<Store>,
-    shard_layout: ShardLayout,
+    shard_version: ShardVersion,
+    num_shards: NumShards,
     enable_flat_storage: bool,
     enable_in_memory_tries: bool,
 }
@@ -86,7 +87,8 @@ impl TestTriesBuilder {
     pub fn new() -> Self {
         Self {
             store: None,
-            shard_layout: ShardLayout::single_shard(),
+            shard_version: 0,
+            num_shards: 1,
             enable_flat_storage: false,
             enable_in_memory_tries: false,
         }
@@ -97,8 +99,9 @@ impl TestTriesBuilder {
         self
     }
 
-    pub fn with_shard_layout(mut self, shard_layout: ShardLayout) -> Self {
-        self.shard_layout = shard_layout;
+    pub fn with_shard_layout(mut self, shard_version: ShardVersion, num_shards: NumShards) -> Self {
+        self.shard_version = shard_version;
+        self.num_shards = num_shards;
         self
     }
 
@@ -112,21 +115,17 @@ impl TestTriesBuilder {
         self
     }
 
-    pub fn build2(self) -> (ShardTries, ShardLayout) {
-        let shard_layout = self.shard_layout.clone();
-        let shard_tries = self.build();
-        (shard_tries, shard_layout)
-    }
-
     pub fn build(self) -> ShardTries {
         if self.enable_in_memory_tries && !self.enable_flat_storage {
             panic!("In-memory tries require flat storage");
         }
         let store = self.store.unwrap_or_else(create_test_store);
-        let shard_uids = self.shard_layout.shard_uids().collect_vec();
-        let flat_storage_manager = FlatStorageManager::new(store.flat_store());
+        let shard_uids = (0..self.num_shards)
+            .map(|shard_id| ShardUId { shard_id: shard_id as u32, version: self.shard_version })
+            .collect::<Vec<_>>();
+        let flat_storage_manager = FlatStorageManager::new(store.clone());
         let tries = ShardTries::new(
-            store.trie_store(),
+            store.clone(),
             TrieConfig {
                 load_mem_tries_for_tracked_shards: self.enable_in_memory_tries,
                 ..Default::default()
@@ -137,17 +136,27 @@ impl TestTriesBuilder {
         );
         if self.enable_flat_storage {
             let mut store_update = tries.store_update();
-            for &shard_uid in &shard_uids {
-                let flat_head = BlockInfo::genesis(CryptoHash::default(), 0);
-                store_update.flat_store_update().set_flat_storage_status(
+            for shard_id in 0..self.num_shards {
+                let shard_uid = ShardUId {
+                    version: self.shard_version,
+                    shard_id: shard_id.try_into().unwrap(),
+                };
+                store_helper::set_flat_storage_status(
+                    &mut store_update,
                     shard_uid,
-                    FlatStorageStatus::Ready(FlatStorageReadyStatus { flat_head }),
+                    FlatStorageStatus::Ready(FlatStorageReadyStatus {
+                        flat_head: BlockInfo::genesis(CryptoHash::default(), 0),
+                    }),
                 );
             }
             store_update.commit().unwrap();
 
             let flat_storage_manager = tries.get_flat_storage_manager();
-            for &shard_uid in &shard_uids {
+            for shard_id in 0..self.num_shards {
+                let shard_uid = ShardUId {
+                    version: self.shard_version,
+                    shard_id: shard_id.try_into().unwrap(),
+                };
                 flat_storage_manager.create_flat_storage_for_shard(shard_uid).unwrap();
             }
         }
@@ -165,7 +174,6 @@ impl TestTriesBuilder {
                 0,
                 0,
                 congestion_info,
-                BandwidthRequests::default_for_protocol_version(PROTOCOL_VERSION),
             );
             let mut update_for_chunk_extra = store.store_update();
             for shard_uid in &shard_uids {
@@ -179,7 +187,7 @@ impl TestTriesBuilder {
             }
             update_for_chunk_extra.commit().unwrap();
 
-            tries.load_mem_tries_for_enabled_shards(&shard_uids, &[].into(), false).unwrap();
+            tries.load_mem_tries_for_enabled_shards(&shard_uids, false).unwrap();
         }
         tries
     }
@@ -212,15 +220,17 @@ pub fn test_populate_flat_storage(
     prev_block_hash: &CryptoHash,
     changes: &Vec<(Vec<u8>, Option<Vec<u8>>)>,
 ) {
-    let mut store_update = tries.store().flat_store().store_update();
-    store_update.set_flat_storage_status(
+    let mut store_update = tries.store_update();
+    store_helper::set_flat_storage_status(
+        &mut store_update,
         shard_uid,
         crate::flat::FlatStorageStatus::Ready(FlatStorageReadyStatus {
             flat_head: BlockInfo { hash: *block_hash, prev_hash: *prev_block_hash, height: 1 },
         }),
     );
     for (key, value) in changes {
-        store_update.set(
+        store_helper::set_flat_state_value(
+            &mut store_update,
             shard_uid,
             key.clone(),
             value.as_ref().map(|value| FlatStateValue::on_disk(value)),

@@ -1,16 +1,27 @@
-#[cfg(test)]
-use crate::trie::ops::interface::GenericNodeOrIndex;
-use crate::trie::ops::resharding::{
-    boundary_account_to_intervals, intervals_to_nibbles, GenericTrieUpdateRetain, RetainMode,
-};
-use crate::trie::trie_storage_update::TrieStorageUpdate;
-use crate::{Trie, TrieChanges};
+use crate::{NibbleSlice, TrieChanges};
 
 use super::arena::ArenaMemory;
-use super::mem_trie_update::MemTrieUpdate;
-use near_primitives::errors::StorageError;
-use near_primitives::types::{AccountId, StateRoot};
+use super::updating::{MemTrieUpdate, OldOrUpdatedNodeId, TrieAccesses, UpdatedMemTrieNode};
+use itertools::Itertools;
+use near_primitives::types::AccountId;
 use std::ops::Range;
+
+/// Whether to retain left or right part of trie after shard split.
+pub enum RetainMode {
+    Left,
+    Right,
+}
+
+/// Decision on the subtree exploration.
+#[derive(Debug)]
+enum RetainDecision {
+    /// Retain the whole subtree.
+    RetainAll,
+    /// The whole subtree is not retained.
+    DiscardAll,
+    /// Descend into all child subtrees.
+    Descend,
+}
 
 impl<'a, M: ArenaMemory> MemTrieUpdate<'a, M> {
     /// Splits the trie, separating entries by the boundary account.
@@ -21,11 +32,12 @@ impl<'a, M: ArenaMemory> MemTrieUpdate<'a, M> {
     /// responsibility to apply the changes.
     pub fn retain_split_shard(
         self,
-        boundary_account: &AccountId,
-        retain_mode: RetainMode,
-    ) -> TrieChanges {
-        let intervals = boundary_account_to_intervals(boundary_account, retain_mode);
-        self.retain_multi_range(&intervals)
+        _boundary_account: AccountId,
+        _retain_mode: RetainMode,
+    ) -> (TrieChanges, TrieAccesses) {
+        // TODO(#12074): generate intervals in nibbles.
+
+        self.retain_multi_range(&[])
     }
 
     /// Retains keys belonging to any of the ranges given in `intervals` from
@@ -33,45 +45,149 @@ impl<'a, M: ArenaMemory> MemTrieUpdate<'a, M> {
     ///
     /// Returns changes to be applied to in-memory trie and proof of the
     /// retain operation.
-    fn retain_multi_range(mut self, intervals: &[Range<Vec<u8>>]) -> TrieChanges {
+    fn retain_multi_range(mut self, intervals: &[Range<Vec<u8>>]) -> (TrieChanges, TrieAccesses) {
         debug_assert!(intervals.iter().all(|range| range.start < range.end));
-        let intervals_nibbles = intervals_to_nibbles(intervals);
+        let intervals_nibbles = intervals
+            .iter()
+            .map(|range| {
+                NibbleSlice::new(&range.start).iter().collect_vec()
+                    ..NibbleSlice::new(&range.end).iter().collect_vec()
+            })
+            .collect_vec();
 
-        // TODO(resharding): consider handling the case when no changes are made.
-        self.retain_multi_range_recursive(0, vec![], &intervals_nibbles).unwrap();
+        // TODO(#12074): consider handling the case when no changes are made.
+        // TODO(#12074): restore proof as well.
+        self.retain_multi_range_recursive(0, vec![], &intervals_nibbles);
         self.to_trie_changes()
     }
-}
 
-impl Trie {
-    pub fn retain_split_shard(
-        &self,
-        boundary_account: &AccountId,
-        retain_mode: RetainMode,
-    ) -> Result<StateRoot, StorageError> {
-        let intervals = boundary_account_to_intervals(boundary_account, retain_mode);
-        self.retain_multi_range(&intervals)
-    }
-
-    fn retain_multi_range(&self, intervals: &[Range<Vec<u8>>]) -> Result<StateRoot, StorageError> {
-        debug_assert!(intervals.iter().all(|range| range.start < range.end));
-        let intervals_nibbles = intervals_to_nibbles(intervals);
-
-        let mut trie_update = TrieStorageUpdate::new(&self);
-        let root_node = self.move_node_to_mutable(&mut trie_update, &self.root)?;
-
-        trie_update.retain_multi_range_recursive(0, vec![], &intervals_nibbles).unwrap();
-
-        #[cfg(test)]
-        {
-            self.memory_usage_verify(&trie_update, GenericNodeOrIndex::Updated(root_node.0));
+    /// Recursive implementation of the algorithm of retaining keys belonging to
+    /// any of the ranges given in `intervals` from the trie. All changes are
+    /// applied in `updated_nodes`.
+    ///
+    /// `node_id` is the root of subtree being explored.
+    /// `key_nibbles` is the key corresponding to `root`.
+    /// `intervals_nibbles` is the list of ranges to be retained.
+    fn retain_multi_range_recursive(
+        &mut self,
+        node_id: usize,
+        key_nibbles: Vec<u8>,
+        intervals_nibbles: &[Range<Vec<u8>>],
+    ) {
+        let decision = retain_decision(&key_nibbles, intervals_nibbles);
+        match decision {
+            RetainDecision::RetainAll => return,
+            RetainDecision::DiscardAll => {
+                let _ = self.take_node(node_id);
+                self.place_node(node_id, UpdatedMemTrieNode::Empty);
+                return;
+            }
+            RetainDecision::Descend => {
+                // We need to descend into all children. The logic follows below.
+            }
         }
-        let result = trie_update.flatten_nodes(&self.root, root_node.0)?;
-        Ok(result.new_root)
+
+        let node = self.take_node(node_id);
+        match node {
+            UpdatedMemTrieNode::Empty => {
+                // Nowhere to descend.
+                self.place_node(node_id, UpdatedMemTrieNode::Empty);
+                return;
+            }
+            UpdatedMemTrieNode::Leaf { extension, value } => {
+                let full_key_nibbles =
+                    [key_nibbles, NibbleSlice::from_encoded(&extension).0.iter().collect_vec()]
+                        .concat();
+                if !intervals_nibbles.iter().any(|interval| interval.contains(&full_key_nibbles)) {
+                    self.place_node(node_id, UpdatedMemTrieNode::Empty);
+                } else {
+                    self.place_node(node_id, UpdatedMemTrieNode::Leaf { extension, value });
+                }
+                return;
+            }
+            UpdatedMemTrieNode::Branch { mut children, mut value } => {
+                if !intervals_nibbles.iter().any(|interval| interval.contains(&key_nibbles)) {
+                    value = None;
+                }
+
+                for (i, child) in children.iter_mut().enumerate() {
+                    let Some(old_child_id) = child.take() else {
+                        continue;
+                    };
+
+                    let new_child_id = self.ensure_updated(old_child_id);
+                    let child_key_nibbles = [key_nibbles.clone(), vec![i as u8]].concat();
+                    self.retain_multi_range_recursive(
+                        new_child_id,
+                        child_key_nibbles,
+                        intervals_nibbles,
+                    );
+                    if self.updated_nodes[new_child_id] == Some(UpdatedMemTrieNode::Empty) {
+                        *child = None;
+                    } else {
+                        *child = Some(OldOrUpdatedNodeId::Updated(new_child_id));
+                    }
+                }
+
+                self.place_node(node_id, UpdatedMemTrieNode::Branch { children, value });
+            }
+            UpdatedMemTrieNode::Extension { extension, child } => {
+                let new_child_id = self.ensure_updated(child);
+                let extension_nibbles =
+                    NibbleSlice::from_encoded(&extension).0.iter().collect_vec();
+                let child_key = [key_nibbles, extension_nibbles].concat();
+                self.retain_multi_range_recursive(new_child_id, child_key, intervals_nibbles);
+
+                let node = UpdatedMemTrieNode::Extension {
+                    extension,
+                    child: OldOrUpdatedNodeId::Updated(new_child_id),
+                };
+                self.place_node(node_id, node);
+            }
+        }
+
+        // We may need to change node type to keep the trie structure unique.
+        self.squash_node(node_id);
     }
 }
 
-// TODO(resharding): consider adding tests for `retain_split_shard` API.
+/// Based on the key and the intervals, makes decision on the subtree exploration.
+fn retain_decision(key: &[u8], intervals: &[Range<Vec<u8>>]) -> RetainDecision {
+    let mut should_descend = false;
+    for interval in intervals {
+        // If key can be extended to be equal to start or end of the interval,
+        // its subtree may have keys inside the interval. At the same time,
+        // it can be extended with bytes which would fall outside the interval.
+        //
+        // For example, if key is "a" and interval is "ab".."cd", subtree may
+        // contain both "aa" which must be excluded and "ac" which must be
+        // retained.
+        if interval.start.starts_with(key) || interval.end.starts_with(key) {
+            should_descend = true;
+            continue;
+        }
+
+        // If key is not a prefix of boundaries and falls inside the interval,
+        // one can show that all the keys in the subtree are also inside the
+        // interval.
+        if interval.start.as_slice() <= key && key < interval.end.as_slice() {
+            return RetainDecision::RetainAll;
+        }
+
+        // Otherwise, all the keys in the subtree are outside the interval.
+    }
+
+    if should_descend {
+        RetainDecision::Descend
+    } else {
+        RetainDecision::DiscardAll
+    }
+}
+
+// TODO(#12074): tests for
+// - `retain_split_shard` API
+// - checking not accessing not-inlined values
+// - proof correctness
 #[cfg(test)]
 mod tests {
     use rand::rngs::StdRng;
@@ -83,16 +199,18 @@ mod tests {
     use itertools::Itertools;
     use near_primitives::{shard_layout::ShardUId, types::StateRoot};
 
-    use crate::test_utils::TestTriesBuilder;
-    use crate::trie::mem::iter::MemTrieIterator;
-    use crate::trie::mem::mem_trie_update::TrackingMode;
-    use crate::trie::mem::mem_tries::MemTries;
-    use crate::trie::mem::nibbles_utils::{
-        all_two_nibble_nibbles, hex_to_nibbles, multi_hex_to_nibbles,
+    use crate::{
+        test_utils::TestTriesBuilder,
+        trie::{
+            mem::{
+                iter::MemTrieIterator,
+                mem_tries::MemTries,
+                nibbles_utils::{all_two_nibble_nibbles, hex_to_nibbles, multi_hex_to_nibbles},
+            },
+            trie_storage::TrieMemoryPartialStorage,
+        },
+        Trie,
     };
-    use crate::trie::trie_recording::TrieRecorder;
-    use crate::trie::trie_storage::TrieMemoryPartialStorage;
-    use crate::trie::Trie;
 
     // Logic for a single test.
     // Creates trie from initial entries, applies retain multi range to it and
@@ -111,51 +229,30 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.clone(), Some(value.clone())))
             .collect_vec();
-        let expected_naive_state_root = crate::test_utils::test_populate_trie(
+        let expected_state_root = crate::test_utils::test_populate_trie(
             &shard_tries,
             &Trie::EMPTY_ROOT,
             ShardUId::single_shard(),
             changes,
         );
 
-        let shard_tries = TestTriesBuilder::new().build();
-        let initial_changes = initial_entries
-            .iter()
-            .map(|(key, value)| (key.clone(), Some(value.clone())))
-            .collect_vec();
-        let initial_state_root = crate::test_utils::test_populate_trie(
-            &shard_tries,
-            &Trie::EMPTY_ROOT,
-            ShardUId::single_shard(),
-            initial_changes,
-        );
-        let trie = shard_tries.get_trie_for_shard(ShardUId::single_shard(), initial_state_root);
-        let expected_disk_state_root = trie.retain_multi_range(&retain_multi_ranges).unwrap();
-
         let mut memtries = MemTries::new(ShardUId::single_shard());
-        let mut update = memtries.update(Trie::EMPTY_ROOT, TrackingMode::None).unwrap();
+        let mut update = memtries.update(Trie::EMPTY_ROOT, false).unwrap();
         for (key, value) in initial_entries {
-            update.insert(&key, value).unwrap();
+            update.insert(&key, value);
         }
         let memtrie_changes = update.to_mem_trie_changes_only();
         let state_root = memtries.apply_memtrie_changes(0, &memtrie_changes);
 
-        let mut trie_recorder = TrieRecorder::new();
-        let mode = TrackingMode::RefcountsAndAccesses(&mut trie_recorder);
-        let update = memtries.update(state_root, mode).unwrap();
-        let mut trie_changes = update.retain_multi_range(&retain_multi_ranges);
+        let update = memtries.update(state_root, true).unwrap();
+        let (mut trie_changes, _) = update.retain_multi_range(&retain_multi_ranges);
         let memtrie_changes = trie_changes.mem_trie_changes.take().unwrap();
-        let mem_state_root = memtries.apply_memtrie_changes(1, &memtrie_changes);
-        let proof = trie_recorder.recorded_storage();
+        let new_state_root = memtries.apply_memtrie_changes(1, &memtrie_changes);
 
-        let partial_trie = Trie::from_recorded_storage(proof, state_root, false);
-        let expected_proof_based_state_root =
-            partial_trie.retain_multi_range(&retain_multi_ranges).unwrap();
-
-        let entries = if mem_state_root != StateRoot::default() {
-            let state_root_ptr = memtries.get_root(&mem_state_root).unwrap();
+        let entries = if new_state_root != StateRoot::default() {
+            let state_root_ptr = memtries.get_root(&new_state_root).unwrap();
             let trie =
-                Trie::new(Arc::new(TrieMemoryPartialStorage::default()), mem_state_root, None);
+                Trie::new(Arc::new(TrieMemoryPartialStorage::default()), new_state_root, None);
             MemTrieIterator::new(Some(state_root_ptr), &trie).map(|e| e.unwrap()).collect_vec()
         } else {
             vec![]
@@ -165,13 +262,7 @@ mod tests {
         assert_eq!(entries, retain_result_naive);
 
         // Check state root, because it must be unique.
-        assert_eq!(mem_state_root, expected_naive_state_root);
-
-        // Check state root with disk-trie state root.
-        assert_eq!(mem_state_root, expected_disk_state_root);
-
-        // Check state root resulting by retain based on partial storage.
-        assert_eq!(mem_state_root, expected_proof_based_state_root);
+        assert_eq!(new_state_root, expected_state_root);
     }
 
     #[test]
@@ -312,7 +403,7 @@ mod tests {
     fn test_branch_prefixes() {
         let keys = multi_hex_to_nibbles(
             "
-            00
+            00     
             10
             01
             0000

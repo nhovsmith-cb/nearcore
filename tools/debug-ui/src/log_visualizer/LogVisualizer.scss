@@ -88,7 +88,6 @@
             &.selected {
                 --selection-color: green;
             }
-
             &.child-selected {
                 --selection-color: blue;
             }
@@ -155,16 +154,6 @@
         color: white;
         border-bottom: 1px solid rgb(137, 137, 137);
         font-weight: bold;
-    }
-
-    .copy-icon {
-        padding-left: 4px;
-        font-size: 1.2em;
-        cursor: pointer;
-
-        .copied {
-            padding-left: 4px;
-        }
     }
 }
 

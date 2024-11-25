@@ -9,7 +9,6 @@ use crate::time::Duration;
 
 use super::data::{TestLoopData, TestLoopDataHandle};
 use super::PendingEventsSender;
-use futures::FutureExt;
 
 /// TestLoopSender implements the CanSend methods for an actor that can Handle them. This is
 /// similar to our pattern of having an ActixWarpper around an actor to send messages to it.
@@ -81,7 +80,6 @@ impl<M, A> CanSend<M> for TestLoopSender<A>
 where
     M: actix::Message + Debug + Send + 'static,
     A: Actor + HandlerWithContext<M> + 'static,
-    M::Result: Send,
 {
     fn send(&self, msg: M) {
         let mut this = self.clone();
@@ -102,7 +100,7 @@ impl<M, R, A> CanSend<MessageWithCallback<M, R>> for TestLoopSender<A>
 where
     M: actix::Message<Result = R> + Debug + Send + 'static,
     A: Actor + HandlerWithContext<M> + 'static,
-    R: 'static + Send,
+    R: 'static,
 {
     fn send(&self, msg: MessageWithCallback<M, R>) {
         let mut this = self.clone();
@@ -111,7 +109,7 @@ where
             let MessageWithCallback { message: msg, callback } = msg;
             let actor = data.get_mut(&this.actor_handle);
             let result = actor.handle(msg, &mut this);
-            callback(async move { Ok(result) }.boxed());
+            callback(Ok(result));
         };
         self.pending_events_sender.send_with_delay(
             description,

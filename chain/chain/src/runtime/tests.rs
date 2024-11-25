@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 
 use crate::types::{ChainConfig, RuntimeStorageConfig};
 use crate::{Chain, ChainGenesis, ChainStoreAccess, DoomslugThresholdMode};
-use assert_matches::assert_matches;
 use near_chain_configs::test_utils::{TESTING_INIT_BALANCE, TESTING_INIT_STAKE};
 use near_epoch_manager::shard_tracker::ShardTracker;
 use near_epoch_manager::{EpochManager, RngSeed};
@@ -11,17 +10,13 @@ use near_pool::{
 };
 use near_primitives::action::FunctionCallAction;
 use near_primitives::apply::ApplyChunkReason;
-use near_primitives::bandwidth_scheduler::BlockBandwidthRequests;
 use near_primitives::congestion_info::{BlockCongestionInfo, ExtendedCongestionInfo};
 use near_primitives::epoch_block_info::BlockInfo;
 use near_primitives::receipt::{ActionReceipt, ReceiptV1};
-use near_primitives::stateless_validation::ChunkProductionKey;
 use near_primitives::test_utils::create_test_signer;
 use near_primitives::types::validator_stake::{ValidatorStake, ValidatorStakeIter};
-use near_primitives::version::PROTOCOL_VERSION;
 use near_store::flat::{FlatStateChanges, FlatStateDelta, FlatStateDeltaMetadata};
 use near_store::genesis::initialize_genesis_state;
-use near_vm_runner::{get_contract_cache_key, CompiledContract, CompiledContractInfo};
 use num_rational::Ratio;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 
@@ -47,7 +42,6 @@ use near_store::{get_genesis_state_roots, NodeStorage, PartialStorage};
 use super::*;
 
 use crate::rayon_spawner::RayonAsyncComputationSpawner;
-use near_async::messaging::{noop, IntoMultiSender};
 use near_async::time::Clock;
 use near_primitives::trie_key::TrieKey;
 use primitive_types::U256;
@@ -126,7 +120,7 @@ impl TestEnv {
             FilesystemContractRuntimeCache::new(&dir.as_ref(), None::<&str>).unwrap();
 
         initialize_genesis_state(store.clone(), &genesis, Some(dir.path()));
-        let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config, None);
+        let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config);
         let runtime = NightshadeRuntime::new(
             store.clone(),
             compiled_contract_cache.handle(),
@@ -156,7 +150,7 @@ impl TestEnv {
             {
                 let mut store_update = store.store_update();
                 flat_storage_manager.set_flat_storage_for_genesis(
-                    &mut store_update.flat_store_update(),
+                    &mut store_update,
                     shard_uid,
                     &genesis_hash,
                     0,
@@ -219,15 +213,13 @@ impl TestEnv {
     ) -> ApplyChunkResult {
         // TODO(congestion_control): pass down prev block info and read congestion info from there
         // For now, just use default.
-        // TODO(bandwidth_scheduler) - pass bandwidth requests from prev_block
         let prev_block_hash = self.head.last_block_hash;
-        let epoch_id = self.epoch_manager.get_epoch_id_from_prev_block(&prev_block_hash).unwrap();
-        let shard_layout = self.epoch_manager.get_shard_layout(&epoch_id).unwrap();
-        let shard_index = shard_layout.get_shard_index(shard_id).unwrap();
-        let state_root = self.state_roots[shard_index];
+        let state_root = self.state_roots[shard_id as usize];
         let gas_limit = u64::MAX;
         let height = self.head.height + 1;
         let block_timestamp = 0;
+        let epoch_id =
+            self.epoch_manager.get_epoch_id_from_prev_block(&prev_block_hash).unwrap_or_default();
         let protocol_version = self.epoch_manager.get_epoch_protocol_version(&epoch_id).unwrap();
         let gas_price = self.runtime.genesis_config.min_gas_price;
         let congestion_info = if !ProtocolFeature::CongestionControl.enabled(protocol_version) {
@@ -262,7 +254,6 @@ impl TestEnv {
                     challenges_result,
                     random_seed: CryptoHash::default(),
                     congestion_info,
-                    bandwidth_requests: BlockBandwidthRequests::empty(),
                 },
                 receipts,
                 transactions,
@@ -288,8 +279,8 @@ impl TestEnv {
         let mut store_update = self.runtime.store().store_update();
         let flat_state_changes =
             FlatStateChanges::from_state_changes(&apply_result.trie_changes.state_changes());
-        apply_result.trie_changes.insertions_into(&mut store_update.trie_store_update());
-        apply_result.trie_changes.state_changes_into(&mut store_update.trie_store_update());
+        apply_result.trie_changes.insertions_into(&mut store_update);
+        apply_result.trie_changes.state_changes_into(&mut store_update);
 
         let prev_block_hash = self.head.last_block_hash;
         let epoch_id =
@@ -310,7 +301,7 @@ impl TestEnv {
                 },
             };
             let new_store_update = flat_storage.add_delta(delta).unwrap();
-            store_update.merge(new_store_update.into());
+            store_update.merge(new_store_update);
         }
         store_update.commit().unwrap();
 
@@ -325,21 +316,19 @@ impl TestEnv {
     ) {
         let new_hash = hash(&[(self.head.height + 1) as u8]);
         let shard_ids = self.epoch_manager.shard_ids(&self.head.epoch_id).unwrap();
-        let shard_layout = self.epoch_manager.get_shard_layout(&self.head.epoch_id).unwrap();
         assert_eq!(transactions.len(), shard_ids.len());
         assert_eq!(chunk_mask.len(), shard_ids.len());
         let mut all_proposals = vec![];
         let mut all_receipts = vec![];
         for shard_id in shard_ids {
-            let shard_index = shard_layout.get_shard_index(shard_id).unwrap();
             let (state_root, proposals, receipts) = self.update_runtime(
                 shard_id,
                 new_hash,
-                &transactions[shard_index],
+                &transactions[shard_id as usize],
                 self.last_receipts.get(&shard_id).map_or(&[], |v| v.as_slice()),
                 challenges_result.clone(),
             );
-            self.state_roots[shard_index] = state_root;
+            self.state_roots[shard_id as usize] = state_root;
             all_receipts.extend(receipts);
             all_proposals.append(&mut proposals.clone());
             self.last_shard_proposals.insert(shard_id, proposals);
@@ -402,11 +391,9 @@ impl TestEnv {
             &self.head.epoch_id,
         )
         .unwrap();
-        let shard_layout = self.epoch_manager.get_shard_layout(&self.head.epoch_id).unwrap();
-        let shard_index = shard_layout.get_shard_index(shard_id).unwrap();
         let shard_uid = self.epoch_manager.shard_id_to_uid(shard_id, &self.head.epoch_id).unwrap();
         self.runtime
-            .view_account(&shard_uid, self.state_roots[shard_index], account_id)
+            .view_account(&shard_uid, self.state_roots[shard_id as usize], account_id)
             .unwrap()
             .into()
     }
@@ -738,16 +725,11 @@ fn test_state_sync() {
     env.step_default(vec![staking_transaction]);
     env.step_default(vec![]);
     let block_hash = hash(&[env.head.height as u8]);
-
-    let shard_layout = env.epoch_manager.get_shard_layout(&env.head.epoch_id).unwrap();
-    let shard_id = shard_layout.shard_ids().next().unwrap();
-
     let state_part = env
         .runtime
-        .obtain_state_part(shard_id, &block_hash, &env.state_roots[0], PartId::new(0, 1))
+        .obtain_state_part(0, &block_hash, &env.state_roots[0], PartId::new(0, 1))
         .unwrap();
-    let root_node =
-        env.runtime.get_state_root_node(shard_id, &block_hash, &env.state_roots[0]).unwrap();
+    let root_node = env.runtime.get_state_root_node(0, &block_hash, &env.state_roots[0]).unwrap();
     let mut new_env = TestEnv::new(vec![validators], 2, false);
     for i in 1..=2 {
         let prev_hash = hash(&[new_env.head.height as u8]);
@@ -804,7 +786,7 @@ fn test_state_sync() {
     let epoch_id = &new_env.head.epoch_id;
     new_env
         .runtime
-        .apply_state_part(shard_id, &env.state_roots[0], PartId::new(0, 1), &state_part, epoch_id)
+        .apply_state_part(0, &env.state_roots[0], PartId::new(0, 1), &state_part, epoch_id)
         .unwrap();
     new_env.state_roots[0] = env.state_roots[0];
     for _ in 3..=5 {
@@ -843,16 +825,11 @@ fn test_get_validator_info() {
          expected_endorsements: &mut [u64; 2]| {
             let epoch_id = env.head.epoch_id;
             let height = env.head.height;
-
-            let shard_layout = env.epoch_manager.get_shard_layout(&epoch_id).unwrap();
-            let shard_id = shard_layout.shard_ids().next().unwrap();
-
             let em = env.runtime.epoch_manager.read();
             let bp = em.get_block_producer_info(&epoch_id, height).unwrap();
-            let cp_key = ChunkProductionKey { epoch_id, height_created: height, shard_id };
-            let cp = em.get_chunk_producer_info(&cp_key).unwrap();
+            let cp = em.get_chunk_producer_info(&epoch_id, height, 0).unwrap();
             let stateless_validators =
-                em.get_chunk_validator_assignments(&epoch_id, shard_id, height).ok();
+                em.get_chunk_validator_assignments(&epoch_id, 0, height).ok();
 
             if let Some(vs) = stateless_validators {
                 if vs.contains(&validators[0]) {
@@ -893,18 +870,13 @@ fn test_get_validator_info() {
         &mut expected_chunks,
         &mut expected_endorsements,
     );
-
-    let shard_layout = env.epoch_manager.get_shard_layout(&env.head.epoch_id).unwrap();
-    let shard_id = shard_layout.shard_ids().next().unwrap();
-
     let mut current_epoch_validator_info = vec![
         CurrentEpochValidatorInfo {
             account_id: "test1".parse().unwrap(),
             public_key: block_producers[0].public_key(),
             is_slashed: false,
             stake: TESTING_INIT_STAKE,
-            shards_produced: vec![shard_id],
-            shards_endorsed: vec![shard_id],
+            shards: vec![0],
             num_produced_blocks: expected_blocks[0],
             num_expected_blocks: expected_blocks[0],
             num_produced_chunks: expected_chunks[0],
@@ -921,8 +893,7 @@ fn test_get_validator_info() {
             public_key: block_producers[1].public_key(),
             is_slashed: false,
             stake: TESTING_INIT_STAKE,
-            shards_produced: vec![shard_id],
-            shards_endorsed: vec![shard_id],
+            shards: vec![0],
             num_produced_blocks: expected_blocks[1],
             num_expected_blocks: expected_blocks[1],
             num_produced_chunks: expected_chunks[1],
@@ -940,13 +911,13 @@ fn test_get_validator_info() {
             account_id: "test1".parse().unwrap(),
             public_key: block_producers[0].public_key(),
             stake: TESTING_INIT_STAKE,
-            shards: vec![shard_id],
+            shards: vec![0],
         },
         NextEpochValidatorInfo {
             account_id: "test2".parse().unwrap(),
             public_key: block_producers[1].public_key(),
             stake: TESTING_INIT_STAKE,
-            shards: vec![shard_id],
+            shards: vec![0],
         },
     ];
     let response = env
@@ -1002,15 +973,14 @@ fn test_get_validator_info() {
     current_epoch_validator_info[1].num_expected_blocks = expected_blocks[1];
     current_epoch_validator_info[1].num_produced_chunks = expected_chunks[1];
     current_epoch_validator_info[1].num_expected_chunks = expected_chunks[1];
-    current_epoch_validator_info[1].num_produced_chunks_per_shard = vec![];
-    current_epoch_validator_info[1].num_expected_chunks_per_shard = vec![];
+    current_epoch_validator_info[1].num_produced_chunks_per_shard = vec![expected_chunks[1]];
+    current_epoch_validator_info[1].num_expected_chunks_per_shard = vec![expected_chunks[1]];
     current_epoch_validator_info[1].num_produced_endorsements = expected_endorsements[1];
     current_epoch_validator_info[1].num_expected_endorsements = expected_endorsements[1];
     current_epoch_validator_info[1].num_produced_endorsements_per_shard =
         vec![expected_endorsements[1]];
     current_epoch_validator_info[1].num_expected_endorsements_per_shard =
         vec![expected_endorsements[1]];
-    current_epoch_validator_info[1].shards_produced = vec![];
     assert_eq!(response.current_validators, current_epoch_validator_info);
     assert_eq!(
         response.next_validators,
@@ -1018,7 +988,7 @@ fn test_get_validator_info() {
             account_id: "test2".parse().unwrap(),
             public_key: block_producers[1].public_key(),
             stake: TESTING_INIT_STAKE,
-            shards: vec![ShardId::new(0)],
+            shards: vec![0],
         }]
     );
     assert!(response.current_proposals.is_empty());
@@ -1489,15 +1459,16 @@ fn test_insufficient_stake() {
 #[test]
 fn test_flat_state_usage() {
     let env = TestEnv::new(vec![vec!["test1".parse().unwrap()]], 4, false);
-    let prev_hash = env.head.prev_block_hash;
-    let shard_layout = env.epoch_manager.get_shard_layout_from_prev_block(&prev_hash).unwrap();
-    let shard_id = shard_layout.shard_ids().next().unwrap();
-    let state_root = Trie::EMPTY_ROOT;
-
-    let trie = env.runtime.get_trie_for_shard(shard_id, &prev_hash, state_root, true).unwrap();
+    let trie = env
+        .runtime
+        .get_trie_for_shard(0, &env.head.prev_block_hash, Trie::EMPTY_ROOT, true)
+        .unwrap();
     assert!(trie.has_flat_storage_chunk_view());
 
-    let trie = env.runtime.get_view_trie_for_shard(shard_id, &prev_hash, state_root).unwrap();
+    let trie = env
+        .runtime
+        .get_view_trie_for_shard(0, &env.head.prev_block_hash, Trie::EMPTY_ROOT)
+        .unwrap();
     assert!(!trie.has_flat_storage_chunk_view());
 }
 
@@ -1532,13 +1503,11 @@ fn test_trie_and_flat_state_equality() {
     // Extract account in two ways:
     // - using state trie, which should use flat state after enabling it in the protocol
     // - using view state, which should never use flat state
-    let prev_hash = env.head.prev_block_hash;
-    let shard_layout = env.epoch_manager.get_shard_layout_from_prev_block(&prev_hash).unwrap();
-    let shard_id = shard_layout.shard_ids().next().unwrap();
-
+    let head_prev_block_hash = env.head.prev_block_hash;
     let state_root = env.state_roots[0];
-    let state = env.runtime.get_trie_for_shard(shard_id, &prev_hash, state_root, true).unwrap();
-    let view_state = env.runtime.get_view_trie_for_shard(shard_id, &prev_hash, state_root).unwrap();
+    let state = env.runtime.get_trie_for_shard(0, &head_prev_block_hash, state_root, true).unwrap();
+    let view_state =
+        env.runtime.get_view_trie_for_shard(0, &head_prev_block_hash, state_root).unwrap();
     let trie_key = TrieKey::Account { account_id: validators[1].clone() };
     let key = trie_key.to_vec();
 
@@ -1559,7 +1528,7 @@ fn test_genesis_hash() {
 
     let tempdir = tempfile::tempdir().unwrap();
     initialize_genesis_state(store.clone(), &genesis, Some(tempdir.path()));
-    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config, None);
+    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config);
     let runtime = NightshadeRuntime::test_with_runtime_config_store(
         tempdir.path(),
         store.clone(),
@@ -1659,7 +1628,6 @@ fn get_test_env_with_chain_and_pool() -> (TestEnv, Chain, TransactionPool) {
         None,
         Arc::new(RayonAsyncComputationSpawner),
         MutableConfigValue::new(None, "validator_signer"),
-        noop().into_multi_sender(),
     )
     .unwrap();
 
@@ -1683,10 +1651,8 @@ fn prepare_transactions(
     transaction_groups: &mut dyn TransactionGroupIterator,
     storage_config: RuntimeStorageConfig,
 ) -> Result<PreparedTransactions, Error> {
-    let prev_hash = env.head.prev_block_hash;
-    let shard_layout = env.epoch_manager.get_shard_layout_from_prev_block(&prev_hash).unwrap();
-    let shard_id = shard_layout.shard_ids().next().unwrap();
-    let block = chain.get_block(&prev_hash).unwrap();
+    let shard_id = 0;
+    let block = chain.get_block(&env.head.prev_block_hash).unwrap();
     let congestion_info = block.block_congestion_info();
 
     env.runtime.prepare_transactions(
@@ -1807,7 +1773,7 @@ fn test_prepare_transactions_empty_storage_proof() {
 #[test]
 #[cfg_attr(not(feature = "test_features"), ignore)]
 fn test_storage_proof_garbage() {
-    let shard_id = ShardId::new(0);
+    let shard_id = 0;
     let signer = create_test_signer("test1");
     let env = TestEnv::new(vec![vec![signer.validator_id().clone()]], 100, false);
     let garbage_size_mb = 50usize;
@@ -1838,76 +1804,6 @@ fn test_storage_proof_garbage() {
     let PartialState::TrieValues(storage_proof) = apply_result.proof.unwrap().nodes;
     let total_size: usize = storage_proof.iter().map(|v| v.len()).sum();
     assert_eq!(total_size / 1000_000, garbage_size_mb);
-}
-
-/// Tests that precompiling a set of contracts updates the compiled contract cache.
-#[test]
-fn test_precompile_contracts_updates_cache() {
-    struct FakeTestCompiledContractType; // For testing AnyCache.
-    let genesis = Genesis::test(vec!["test0".parse().unwrap()], 1);
-    let store = near_store::test_utils::create_test_store();
-    let tempdir = tempfile::tempdir().unwrap();
-    initialize_genesis_state(store.clone(), &genesis, Some(tempdir.path()));
-    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config, None);
-
-    let contract_cache = FilesystemContractRuntimeCache::new(tempdir.path(), None::<&str>)
-        .expect("filesystem contract cache");
-    let runtime = NightshadeRuntime::test_with_runtime_config_store(
-        tempdir.path(),
-        store,
-        contract_cache.handle(),
-        &genesis.config,
-        epoch_manager,
-        RuntimeConfigStore::new(None),
-        StateSnapshotType::EveryEpoch,
-    );
-
-    let contracts = vec![
-        ContractCode::new(near_test_contracts::sized_contract(100).to_vec(), None),
-        ContractCode::new(near_test_contracts::rs_contract().to_vec(), None),
-        ContractCode::new(near_test_contracts::trivial_contract().to_vec(), None),
-    ];
-    let code_hashes: Vec<CryptoHash> = contracts.iter().map(|c| c.hash()).cloned().collect();
-
-    // First check that the cache does not have the contracts.
-    for code_hash in code_hashes.iter() {
-        let cache_key = get_contract_cache_key(
-            *code_hash,
-            &runtime.get_runtime_config(PROTOCOL_VERSION).unwrap().wasm_config,
-        );
-        let contract = contract_cache.get(&cache_key).unwrap();
-        assert!(contract.is_none());
-    }
-
-    runtime.precompile_contracts(&EpochId::default(), contracts).unwrap();
-
-    // Check that the persistent cache contains the compiled contract after precompilation,
-    // but it does not populate the in-memory cache (so that the value is generated by try_lookup call).
-    for code_hash in code_hashes.into_iter() {
-        let cache_key = get_contract_cache_key(
-            code_hash,
-            &runtime.get_runtime_config(PROTOCOL_VERSION).unwrap().wasm_config,
-        );
-
-        let contract = contract_cache.get(&cache_key).unwrap();
-        assert_matches!(
-            contract,
-            Some(CompiledContractInfo { compiled: CompiledContract::Code(_), .. })
-        );
-
-        let result = contract_cache
-            .memory_cache()
-            .try_lookup(
-                cache_key,
-                || Ok::<_, ()>(Box::new(FakeTestCompiledContractType)),
-                |v| {
-                    assert!(v.is::<FakeTestCompiledContractType>());
-                    "compiled code"
-                },
-            )
-            .unwrap();
-        assert_eq!(result, "compiled code");
-    }
 }
 
 fn stake(

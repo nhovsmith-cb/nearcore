@@ -7,7 +7,6 @@ import { HeaderBar } from './HeaderBar';
 import { LatestBlocksView } from './LatestBlocksView';
 import { NetworkInfoView } from './NetworkInfoView';
 import { EntityDebugView } from './entity_debug/EntityDebugView';
-import { SyncInfoView } from './SyncInfoView';
 
 function useNodeAddr(): string {
     const params = useParams<{ addr: string }>();
@@ -55,7 +54,7 @@ export const App = () => {
                     path="chain_and_chunk_info/*"
                     element={<ChainAndChunkInfoView addr={addr} />}
                 />
-                <Route path="sync_info" element={<SyncInfoView addr={addr}></SyncInfoView>} />
+                <Route path="sync_info" element={<div>TODO</div>} />
                 <Route path="validator_info" element={<div>TODO</div>} />
                 <Route path="cluster" element={<ClusterView initialAddr={addr} />} />
                 <Route path="entity_debug" element={<EntityDebugView addr={addr} />} />

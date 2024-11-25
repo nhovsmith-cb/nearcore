@@ -20,7 +20,7 @@ const NUM_CLIENTS: usize = 4;
 // Test that a new node that only has genesis can use whatever method available
 // to sync up to the current state of the network.
 #[test]
-fn slow_test_sync_from_genesis() {
+fn test_sync_from_genesis() {
     init_test_logger();
     let builder = TestLoopBuilder::new();
 
@@ -44,13 +44,10 @@ fn slow_test_sync_from_genesis() {
     for account in &accounts {
         genesis_builder.add_user_account_simple(account.clone(), initial_balance);
     }
-    let (genesis, epoch_config_store) = genesis_builder.build();
+    let genesis = genesis_builder.build();
 
-    let TestLoopEnv { mut test_loop, datas: node_datas, tempdir } = builder
-        .genesis(genesis.clone())
-        .epoch_config_store(epoch_config_store.clone())
-        .clients(clients)
-        .build();
+    let TestLoopEnv { mut test_loop, datas: node_datas, tempdir } =
+        builder.genesis(genesis.clone()).clients(clients).build();
 
     let first_epoch_tracked_shards = {
         let clients = node_datas
@@ -61,7 +58,7 @@ fn slow_test_sync_from_genesis() {
     };
     tracing::info!("First epoch tracked shards: {:?}", first_epoch_tracked_shards);
 
-    execute_money_transfers(&mut test_loop, &node_datas, &accounts).unwrap();
+    execute_money_transfers(&mut test_loop, &node_datas, &accounts);
 
     // Make sure the chain progresses for several epochs.
     let client_handle = node_datas[0].client_sender.actor_handle();
@@ -101,7 +98,6 @@ fn slow_test_sync_from_genesis() {
 
     let TestLoopEnv { mut test_loop, datas: node_datas, tempdir } = TestLoopBuilder::new()
         .genesis(genesis.clone())
-        .epoch_config_store(epoch_config_store)
         .clients(clients)
         .stores_override(stores)
         .test_loop_data_dir(tempdir)

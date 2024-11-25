@@ -2,8 +2,6 @@ use near_chain_configs::{get_initial_supply, Genesis, GenesisConfig, GenesisReco
 use near_crypto::{InMemorySigner, KeyType};
 use near_parameters::ActionCosts;
 use near_primitives::account::{AccessKey, Account};
-use near_primitives::apply::ApplyChunkReason;
-use near_primitives::bandwidth_scheduler::BlockBandwidthRequests;
 use near_primitives::congestion_info::{BlockCongestionInfo, ExtendedCongestionInfo};
 use near_primitives::hash::{hash, CryptoHash};
 use near_primitives::receipt::Receipt;
@@ -83,7 +81,7 @@ impl StandaloneRuntime {
             account_ids.insert(state_record_to_account_id(record).clone());
         });
         let writers = std::sync::atomic::AtomicUsize::new(0);
-        let shard_uid = genesis.config.shard_layout.shard_uids().next().unwrap();
+        let shard_uid = ShardUId::from_shard_id_and_layout(0, &genesis.config.shard_layout);
         let root = GenesisStateApplier::apply(
             &writers,
             tries.clone(),
@@ -106,7 +104,7 @@ impl StandaloneRuntime {
         let congestion_info = BlockCongestionInfo::new(congestion_info);
 
         let apply_state = ApplyState {
-            apply_reason: ApplyChunkReason::UpdateTrackedShard,
+            apply_reason: None,
             block_height: 1,
             prev_block_hash: Default::default(),
             block_hash: Default::default(),
@@ -124,7 +122,6 @@ impl StandaloneRuntime {
             migration_data: Arc::new(MigrationData::default()),
             migration_flags: MigrationFlags::default(),
             congestion_info,
-            bandwidth_requests: BlockBandwidthRequests::empty(),
         };
 
         Self {
@@ -142,16 +139,10 @@ impl StandaloneRuntime {
         receipts: &[Receipt],
         transactions: &[SignedTransaction],
     ) -> (Vec<Receipt>, Vec<ExecutionOutcomeWithId>) {
-        // TODO - the shard id is correct but the shard version is hardcoded. It
-        // would be better to store the shard layout in self and read the uid
-        // from there.
-        let shard_id = self.apply_state.shard_id;
-        let shard_uid = ShardUId::new(0, shard_id);
-        let trie = self.tries.get_trie_for_shard(shard_uid, self.root);
         let apply_result = self
             .runtime
             .apply(
-                trie,
+                self.tries.get_trie_for_shard(ShardUId::single_shard(), self.root),
                 &None,
                 &self.apply_state,
                 receipts,
@@ -162,7 +153,11 @@ impl StandaloneRuntime {
             .unwrap();
 
         let mut store_update = self.tries.store_update();
-        self.root = self.tries.apply_all(&apply_result.trie_changes, shard_uid, &mut store_update);
+        self.root = self.tries.apply_all(
+            &apply_result.trie_changes,
+            ShardUId::single_shard(),
+            &mut store_update,
+        );
         store_update.commit().unwrap();
         self.apply_state.block_height += 1;
 

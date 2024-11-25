@@ -95,6 +95,7 @@ use near_async::messaging::{self, Handler, Sender};
 use near_async::time::Duration;
 use near_async::time::{self, Clock};
 use near_chain::byzantine_assert;
+use near_chain::chunks_store::ReadOnlyChunksStore;
 use near_chain::near_chain_primitives::error::Error::DBNotFoundErr;
 use near_chain::types::EpochManagerAdapter;
 use near_chain_configs::MutableValidatorSigner;
@@ -107,7 +108,6 @@ use near_network::types::{
 };
 use near_network::types::{NetworkRequests, PeerManagerMessageRequest};
 use near_performance_metrics_macros::perf;
-use near_primitives::bandwidth_scheduler::BandwidthRequests;
 use near_primitives::block::Tip;
 use near_primitives::congestion_info::CongestionInfo;
 use near_primitives::errors::EpochError;
@@ -120,7 +120,6 @@ use near_primitives::sharding::{
     PartialEncodedChunkPart, PartialEncodedChunkV2, ShardChunk, ShardChunkHeader,
     TransactionReceipt,
 };
-use near_primitives::stateless_validation::ChunkProductionKey;
 use near_primitives::transaction::SignedTransaction;
 use near_primitives::types::validator_stake::ValidatorStake;
 use near_primitives::types::{
@@ -130,8 +129,6 @@ use near_primitives::unwrap_or_return;
 use near_primitives::utils::MaybeValidated;
 use near_primitives::validator_signer::ValidatorSigner;
 use near_primitives::version::{ProtocolFeature, ProtocolVersion};
-use near_store::adapter::chunk_store::ChunkStoreAdapter;
-use near_store::adapter::StoreAdapter;
 use near_store::{DBCol, Store, HEADER_HEAD_KEY, HEAD_KEY};
 use rand::seq::IteratorRandom;
 use rand::Rng;
@@ -251,7 +248,7 @@ pub struct ShardsManagerActor {
     /// Lock the value of mutable validator signer for the duration of a request to ensure consistency.
     /// Please note that the locked value should not be stored anywhere or passed through the thread boundary.
     validator_signer: MutableValidatorSigner,
-    store: ChunkStoreAdapter,
+    store: ReadOnlyChunksStore,
 
     /// Epoch manager used to access information about recent epochs (from Hot storage).
     /// For building PartialChunks from Chunks of the garbage collected epochs, use `view_epoch_manager` instead.
@@ -321,6 +318,7 @@ pub fn start_shards_manager(
         .get_ser::<Tip>(DBCol::BlockMisc, HEADER_HEAD_KEY)
         .unwrap()
         .expect("ShardsManager must be initialized after the chain is initialized");
+    let chunks_store = ReadOnlyChunksStore::new(store);
     let shards_manager = ShardsManagerActor::new(
         Clock::real(),
         validator_signer,
@@ -329,7 +327,7 @@ pub fn start_shards_manager(
         shard_tracker,
         network_adapter,
         client_adapter_for_shards_manager,
-        store.chunk_store(),
+        chunks_store,
         chain_head,
         chain_header_head,
         chunk_request_retry_period,
@@ -351,7 +349,7 @@ impl ShardsManagerActor {
         shard_tracker: ShardTracker,
         network_adapter: Sender<PeerManagerMessageRequest>,
         client_adapter: Sender<ShardsManagerResponse>,
-        store: ChunkStoreAdapter,
+        store: ReadOnlyChunksStore,
         initial_chain_head: Tip,
         initial_chain_header_head: Tip,
         chunk_request_retry_period: Duration,
@@ -441,14 +439,11 @@ impl ShardsManagerActor {
                 &self.shard_tracker,
             );
 
-        let chunk_producer_account_id = self
-            .epoch_manager
-            .get_chunk_producer_info(&ChunkProductionKey {
-                epoch_id: self.epoch_manager.get_epoch_id_from_prev_block(ancestor_hash)?,
-                height_created: height,
-                shard_id,
-            })?
-            .take_account_id();
+        let chunk_producer_account_id = self.epoch_manager.as_ref().get_chunk_producer(
+            &self.epoch_manager.get_epoch_id_from_prev_block(ancestor_hash)?,
+            height,
+            shard_id,
+        )?;
 
         // In the following we compute which target accounts we should request parts and receipts from
         // First we choose a shard representative target which is either the original chunk producer
@@ -529,7 +524,7 @@ impl ShardsManagerActor {
                 debug!(
                     target: "chunks",
                     ?part_ords,
-                    ?shard_id,
+                    shard_id,
                     ?target_account,
                     prefer_peer,
                     "Requesting parts",
@@ -649,14 +644,8 @@ impl ShardsManagerActor {
                 return Ok(true);
             }
         }
-        let chunk_producer = self
-            .epoch_manager
-            .get_chunk_producer_info(&ChunkProductionKey {
-                epoch_id,
-                height_created: next_chunk_height,
-                shard_id,
-            })?
-            .take_account_id();
+        let chunk_producer =
+            self.epoch_manager.get_chunk_producer(&epoch_id, next_chunk_height, shard_id)?;
         if &chunk_producer == me {
             return Ok(true);
         }
@@ -695,18 +684,18 @@ impl ShardsManagerActor {
             target: "chunks",
             "request_chunk_single",
             ?chunk_hash,
-            ?shard_id,
+            shard_id,
             height_created = height)
         .entered();
 
         if self.requested_partial_encoded_chunks.contains_key(&chunk_hash) {
-            debug!(target: "chunks", height, ?shard_id, ?chunk_hash, "Not requesting chunk, already being requested.");
+            debug!(target: "chunks", height, shard_id, ?chunk_hash, "Not requesting chunk, already being requested.");
             return;
         }
 
         if let Some(entry) = self.encoded_chunks.get(&chunk_header.chunk_hash()) {
             if entry.complete {
-                debug!(target: "chunks", height, ?shard_id, ?chunk_hash, "Not requesting chunk, already complete.");
+                debug!(target: "chunks", height, shard_id, ?chunk_hash, "Not requesting chunk, already complete.");
                 return;
             }
         } else {
@@ -714,7 +703,7 @@ impl ShardsManagerActor {
             // However, if the chunk had just been processed and marked as complete, it might have
             // been removed from the cache if it is out of horizon. So in this case, the chunk is
             // already complete and we don't need to request anything.
-            debug!(target: "chunks", height, ?shard_id, ?chunk_hash, "Not requesting chunk, already complete and GC-ed.");
+            debug!(target: "chunks", height, shard_id, ?chunk_hash, "Not requesting chunk, already complete and GC-ed.");
             return;
         }
 
@@ -732,7 +721,7 @@ impl ShardsManagerActor {
         );
 
         if mark_only {
-            debug!(target: "chunks", height, ?shard_id, ?chunk_hash, "Marked the chunk as being requested but did not send the request yet.");
+            debug!(target: "chunks", height, shard_id, ?chunk_hash, "Marked the chunk as being requested but did not send the request yet.");
             return;
         }
 
@@ -760,7 +749,7 @@ impl ShardsManagerActor {
         // we want to give some time for any `PartialEncodedChunkForward` messages to arrive
         // before we send requests.
         if !should_wait_for_chunk_forwarding || fetch_from_archival || old_block {
-            debug!(target: "chunks", height, ?shard_id, ?chunk_hash, "Requesting.");
+            debug!(target: "chunks", height, shard_id, ?chunk_hash, "Requesting.");
             let request_result = self.request_partial_encoded_chunk(
                 height,
                 &ancestor_hash,
@@ -1053,15 +1042,12 @@ impl ShardsManagerActor {
         // Get outgoing receipts for the chunk and construct vector of their
         // proofs.
         let outgoing_receipts = chunk.prev_outgoing_receipts();
-        let outgoing_receipts_proofs = make_outgoing_receipts_proofs(
+        let present_receipts: HashMap<ShardId, _> = match make_outgoing_receipts_proofs(
             &header,
             &outgoing_receipts,
             self.view_epoch_manager.as_ref(),
-        );
-        let present_receipts: HashMap<ShardId, _> = match outgoing_receipts_proofs {
-            Ok(receipts) => {
-                receipts.into_iter().map(|receipt| (receipt.1.to_shard_id, receipt)).collect()
-            }
+        ) {
+            Ok(receipts) => receipts.map(|receipt| (receipt.1.to_shard_id, receipt)).collect(),
             Err(e) => {
                 warn!(target: "chunks", "Not sending {:?}, failed to make outgoing receipts proofs: {}", chunk.chunk_hash(), e);
                 return;
@@ -1122,7 +1108,7 @@ impl ShardsManagerActor {
             target: "chunks",
             "check_chunk_complete",
             height_included = chunk.cloned_header().height_included(),
-            shard_id = ?chunk.cloned_header().shard_id(),
+            shard_id = chunk.cloned_header().shard_id(),
             chunk_hash = ?chunk.chunk_hash())
         .entered();
 
@@ -1411,7 +1397,7 @@ impl ShardsManagerActor {
 
         // 2. check protocol version
         let protocol_version = self.epoch_manager.get_epoch_protocol_version(&epoch_id)?;
-        if header.validate_version(protocol_version).is_ok() {
+        if header.valid_for(protocol_version) {
             Ok(())
         } else if epoch_id_confirmed {
             Err(Error::InvalidChunkHeader)
@@ -1485,7 +1471,7 @@ impl ShardsManagerActor {
             target: "chunks",
             "process_partial_encoded_chunk",
             ?chunk_hash,
-            shard_id = ?header.shard_id(),
+            shard_id = header.shard_id(),
             height_created = header.height_created(),
             height_included = header.height_included())
         .entered();
@@ -1709,14 +1695,11 @@ impl ShardsManagerActor {
         let have_all_receipts = self.has_all_receipts(&prev_block_hash, entry, me)?;
 
         let can_reconstruct = entry.parts.len() >= self.epoch_manager.num_data_parts();
-        let chunk_producer = self
-            .epoch_manager
-            .get_chunk_producer_info(&ChunkProductionKey {
-                epoch_id,
-                height_created: header.height_created(),
-                shard_id: header.shard_id(),
-            })?
-            .take_account_id();
+        let chunk_producer = self.epoch_manager.get_chunk_producer(
+            &epoch_id,
+            header.height_created(),
+            header.shard_id(),
+        )?;
 
         if have_all_parts {
             if self.encoded_chunks.mark_chunk_for_inclusion(&chunk_hash) {
@@ -1876,14 +1859,11 @@ impl ShardsManagerActor {
             let shard_id = partial_encoded_chunk.header.shard_id();
             let mut accounts_forwarded_to = HashSet::new();
             accounts_forwarded_to.insert(me.clone());
-            let next_chunk_producer = self
-                .epoch_manager
-                .get_chunk_producer_info(&ChunkProductionKey {
-                    epoch_id: *epoch_id,
-                    height_created: current_chunk_height + 1,
-                    shard_id,
-                })?
-                .take_account_id();
+            let next_chunk_producer = self.epoch_manager.get_chunk_producer(
+                &epoch_id,
+                current_chunk_height + 1,
+                shard_id,
+            )?;
             for (bp, _) in block_producers {
                 let bp_account_id = bp.take_account_id();
 
@@ -1923,13 +1903,11 @@ impl ShardsManagerActor {
                 .shard_ids(&epoch_id)?
                 .into_iter()
                 .map(|shard_id| {
-                    self.epoch_manager
-                        .get_chunk_producer_info(&ChunkProductionKey {
-                            epoch_id: *epoch_id,
-                            height_created: current_chunk_height + 1,
-                            shard_id,
-                        })
-                        .map(|info| info.take_account_id())
+                    self.epoch_manager.get_chunk_producer(
+                        &epoch_id,
+                        current_chunk_height + 1,
+                        shard_id,
+                    )
                 })
                 .collect::<Result<HashSet<_>, _>>()?;
             next_chunk_producers.remove(me);
@@ -2016,7 +1994,6 @@ impl ShardsManagerActor {
         prev_outgoing_receipts_root: CryptoHash,
         tx_root: CryptoHash,
         congestion_info: Option<CongestionInfo>,
-        bandwidth_requests: Option<BandwidthRequests>,
         signer: &ValidatorSigner,
         rs: &ReedSolomon,
         protocol_version: ProtocolVersion,
@@ -2037,7 +2014,6 @@ impl ShardsManagerActor {
             prev_outgoing_receipts,
             prev_outgoing_receipts_root,
             congestion_info,
-            bandwidth_requests,
             signer,
             protocol_version,
         )
@@ -2081,7 +2057,6 @@ impl ShardsManagerActor {
             &outgoing_receipts,
             self.epoch_manager.as_ref(),
         )?
-        .into_iter()
         .map(Arc::new)
         .collect::<Vec<_>>();
         for (to_whom, part_ords) in block_producer_mapping {
@@ -2307,14 +2282,12 @@ mod test {
     /// should not request partial encoded chunk from self
     #[test]
     fn test_request_partial_encoded_chunk_from_self() {
-        let epoch_id = EpochId::default();
-        let next_epoch_id = EpochId::default();
         let mock_tip = Tip {
             height: 0,
             last_block_hash: CryptoHash::default(),
             prev_block_hash: CryptoHash::default(),
-            epoch_id,
-            next_epoch_id,
+            epoch_id: EpochId::default(),
+            next_epoch_id: EpochId::default(),
         };
         let store = create_test_store();
         let epoch_manager = setup_epoch_manager_with_block_and_chunk_producers(
@@ -2325,8 +2298,6 @@ mod test {
             2,
         );
         let epoch_manager = Arc::new(epoch_manager.into_handle());
-        let shard_layout = epoch_manager.get_shard_layout(&epoch_id).unwrap();
-        let shard_id = shard_layout.shard_ids().next().unwrap();
         let shard_tracker = ShardTracker::new(TrackedConfig::AllShards, epoch_manager.clone());
         let network_adapter = Arc::new(MockPeerManagerAdapter::default());
         let client_adapter = Arc::new(MockClientAdapterForShardsManager::default());
@@ -2339,7 +2310,7 @@ mod test {
             shard_tracker,
             network_adapter.as_sender(),
             client_adapter.as_sender(),
-            store.chunk_store(),
+            ReadOnlyChunksStore::new(store),
             mock_tip.clone(),
             mock_tip,
             Duration::hours(1),
@@ -2351,7 +2322,7 @@ mod test {
                 height: 0,
                 ancestor_hash: Default::default(),
                 prev_block_hash: Default::default(),
-                shard_id,
+                shard_id: 0,
                 added,
                 last_requested: added,
             },
@@ -2384,7 +2355,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -2465,7 +2436,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -2497,7 +2468,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -2580,7 +2551,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -2671,7 +2642,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -2748,7 +2719,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -2817,7 +2788,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -2854,7 +2825,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -2888,7 +2859,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -2922,7 +2893,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -2957,7 +2928,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -3001,7 +2972,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -3049,7 +3020,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -3095,7 +3066,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -3121,7 +3092,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -3147,7 +3118,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -3183,7 +3154,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),
@@ -3217,7 +3188,7 @@ mod test {
             fixture.shard_tracker.clone(),
             fixture.mock_network.as_sender(),
             fixture.mock_client_adapter.as_sender(),
-            fixture.store.clone(),
+            fixture.chain_store.new_read_only_chunks_store(),
             fixture.mock_chain_head.clone(),
             fixture.mock_chain_head.clone(),
             Duration::hours(1),

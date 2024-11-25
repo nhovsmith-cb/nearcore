@@ -4,7 +4,6 @@ use borsh::BorshDeserialize;
 
 use near_crypto::PublicKey;
 use near_epoch_manager::EpochManagerAdapter;
-use near_primitives::bandwidth_scheduler::BandwidthRequests;
 use near_primitives::block::{Block, BlockHeader};
 use near_primitives::challenge::{
     BlockDoubleSign, Challenge, ChallengeBody, ChunkProofs, ChunkState, MaybeEncodedShardChunk,
@@ -13,7 +12,6 @@ use near_primitives::congestion_info::CongestionInfo;
 use near_primitives::hash::CryptoHash;
 use near_primitives::merkle::merklize;
 use near_primitives::sharding::{ShardChunk, ShardChunkHeader};
-use near_primitives::stateless_validation::ChunkProductionKey;
 use near_primitives::transaction::SignedTransaction;
 use near_primitives::types::chunk_extra::ChunkExtra;
 use near_primitives::types::{AccountId, BlockHeight, EpochId, Nonce};
@@ -180,10 +178,6 @@ pub fn validate_chunk_with_chunk_extra_and_receipts_root(
     }
 
     validate_congestion_info(&prev_chunk_extra.congestion_info(), &chunk_header.congestion_info())?;
-    validate_bandwidth_requests(
-        prev_chunk_extra.bandwidth_requests(),
-        chunk_header.bandwidth_requests(),
-    )?;
 
     Ok(())
 }
@@ -215,30 +209,6 @@ fn validate_congestion_info(
                 ))
             }),
     }
-}
-
-fn validate_bandwidth_requests(
-    extra_bandwidth_requests: Option<&BandwidthRequests>,
-    header_bandwidth_requests: Option<&BandwidthRequests>,
-) -> Result<(), Error> {
-    if extra_bandwidth_requests != header_bandwidth_requests {
-        fn requests_len(requests_opt: Option<&BandwidthRequests>) -> usize {
-            match requests_opt {
-                Some(BandwidthRequests::V1(requests_v1)) => requests_v1.requests.len(),
-                None => 0,
-            }
-        }
-        let error_info_str = format!(
-            "chunk extra: (is_some: {}, len: {}) chunk header: (is_some: {}, len: {})",
-            extra_bandwidth_requests.is_some(),
-            requests_len(extra_bandwidth_requests),
-            header_bandwidth_requests.is_some(),
-            requests_len(header_bandwidth_requests)
-        );
-        return Err(Error::InvalidBandwidthRequests(error_info_str));
-    }
-
-    Ok(())
 }
 
 /// Validates a double sign challenge.
@@ -300,13 +270,11 @@ fn validate_chunk_authorship(
         &epoch_id,
         &chunk_header.prev_block_hash(),
     )? {
-        let chunk_producer = epoch_manager
-            .get_chunk_producer_info(&ChunkProductionKey {
-                epoch_id,
-                height_created: chunk_header.height_created(),
-                shard_id: chunk_header.shard_id(),
-            })?
-            .take_account_id();
+        let chunk_producer = epoch_manager.get_chunk_producer(
+            &epoch_id,
+            chunk_header.height_created(),
+            chunk_header.shard_id(),
+        )?;
         Ok(chunk_producer)
     } else {
         Err(Error::InvalidChallenge)

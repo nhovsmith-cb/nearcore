@@ -21,7 +21,6 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-bytesize.workspace = true
 
 near-crypto.workspace = true
 near-o11y.workspace = true
@@ -45,7 +44,6 @@ nightly = [
   "near-wallet-contract/nightly",
   "nightly_protocol",
   "protocol_feature_nonrefundable_transfer_nep491",
-  "protocol_feature_relaxed_chunk_validation",
   "testlib/nightly",
 ]
 nightly_protocol = [
@@ -60,11 +58,13 @@ nightly_protocol = [
   "testlib/nightly_protocol",
 ]
 protocol_feature_nonrefundable_transfer_nep491 = []
-protocol_feature_relaxed_chunk_validation = [
-  "near-primitives/protocol_feature_relaxed_chunk_validation",
-  "near-primitives-core/protocol_feature_relaxed_chunk_validation",
-]
 no_cpu_compatibility_checks = ["near-vm-runner/no_cpu_compatibility_checks"]
+
+no_cache = [
+  "near-vm-runner/no_cache",
+  "near-store/no_cache",
+]
+
 sandbox = ["near-o11y/sandbox", "near-vm-runner/sandbox"]
 test_features = [
   "near-primitives/test_features",

@@ -191,8 +191,6 @@ pub enum StateChangeCause {
     Migration,
     /// State changes for building states for re-sharding
     ReshardingV2,
-    /// Update persistent state kept by Bandwidth Scheduler after running the scheduling algorithm.
-    BandwidthSchedulerStateUpdate,
 }
 
 /// This represents the committed changes in the Trie with a change cause.
@@ -356,9 +354,6 @@ impl StateChanges {
                 TrieKey::PromiseYieldReceipt { .. } => {}
                 TrieKey::BufferedReceiptIndices => {}
                 TrieKey::BufferedReceipt { .. } => {}
-                TrieKey::BandwidthSchedulerState => {}
-                TrieKey::BufferedReceiptGroupsQueueData { .. } => {}
-                TrieKey::BufferedReceiptGroupsQueueItem { .. } => {}
             }
         }
 
@@ -515,11 +510,6 @@ pub mod validator_stake {
     #[serde(tag = "validator_stake_struct_version")]
     pub enum ValidatorStake {
         V1(ValidatorStakeV1),
-        // Warning: if you're adding a new version, make sure that the borsh encoding of
-        // any `ValidatorStake` cannot be equal to the borsh encoding of any `ValidatorStakeV1`.
-        // See `EpochSyncProofEpochData::use_versioned_bp_hash_format` for an explanation.
-        // The simplest way to ensure that is to make sure that any new `ValidatorStakeVx`
-        // begins with a field of type `AccountId`.
     }
 
     pub struct ValidatorStakeIter<'a> {
@@ -728,7 +718,6 @@ pub struct BlockExtra {
 }
 
 pub mod chunk_extra {
-    use crate::bandwidth_scheduler::BandwidthRequests;
     use crate::congestion_info::CongestionInfo;
     use crate::types::validator_stake::{ValidatorStake, ValidatorStakeIter};
     use crate::types::StateRoot;
@@ -745,7 +734,6 @@ pub mod chunk_extra {
         V1(ChunkExtraV1),
         V2(ChunkExtraV2),
         V3(ChunkExtraV3),
-        V4(ChunkExtraV4),
     }
 
     #[derive(Debug, PartialEq, BorshSerialize, BorshDeserialize, Clone, Eq, serde::Serialize)]
@@ -783,27 +771,6 @@ pub mod chunk_extra {
         congestion_info: CongestionInfo,
     }
 
-    /// V3 -> V4: add bandwidth requests field.
-    #[derive(Debug, PartialEq, BorshSerialize, BorshDeserialize, Clone, Eq, serde::Serialize)]
-    pub struct ChunkExtraV4 {
-        /// Post state root after applying give chunk.
-        pub state_root: StateRoot,
-        /// Root of merklizing results of receipts (transactions) execution.
-        pub outcome_root: CryptoHash,
-        /// Validator proposals produced by given chunk.
-        pub validator_proposals: Vec<ValidatorStake>,
-        /// Actually how much gas were used.
-        pub gas_used: Gas,
-        /// Gas limit, allows to increase or decrease limit based on expected time vs real time for computing the chunk.
-        pub gas_limit: Gas,
-        /// Total balance burnt after processing the current chunk.
-        pub balance_burnt: Balance,
-        /// Congestion info about this shard after the chunk was applied.
-        congestion_info: CongestionInfo,
-        /// Requests for bandwidth to send receipts to other shards.
-        pub bandwidth_requests: BandwidthRequests,
-    }
-
     impl ChunkExtra {
         /// This method creates a slimmed down and invalid ChunkExtra. It's used
         /// for resharding where we only need the state root. This should not be
@@ -825,7 +792,6 @@ pub mod chunk_extra {
                 0,
                 0,
                 congestion_control,
-                BandwidthRequests::default_for_protocol_version(PROTOCOL_VERSION),
             )
         }
 
@@ -838,21 +804,8 @@ pub mod chunk_extra {
             gas_limit: Gas,
             balance_burnt: Balance,
             congestion_info: Option<CongestionInfo>,
-            bandwidth_requests: Option<BandwidthRequests>,
         ) -> Self {
-            if ProtocolFeature::BandwidthScheduler.enabled(protocol_version) {
-                assert!(bandwidth_requests.is_some());
-                Self::V4(ChunkExtraV4 {
-                    state_root: *state_root,
-                    outcome_root,
-                    validator_proposals,
-                    gas_used,
-                    gas_limit,
-                    balance_burnt,
-                    congestion_info: congestion_info.unwrap(),
-                    bandwidth_requests: bandwidth_requests.unwrap(),
-                })
-            } else if ProtocolFeature::CongestionControl.enabled(protocol_version) {
+            if ProtocolFeature::CongestionControl.enabled(protocol_version) {
                 assert!(congestion_info.is_some());
                 Self::V3(ChunkExtraV3 {
                     state_root: *state_root,
@@ -882,7 +835,6 @@ pub mod chunk_extra {
                 Self::V1(v1) => &v1.outcome_root,
                 Self::V2(v2) => &v2.outcome_root,
                 Self::V3(v3) => &v3.outcome_root,
-                Self::V4(v4) => &v4.outcome_root,
             }
         }
 
@@ -892,7 +844,6 @@ pub mod chunk_extra {
                 Self::V1(v1) => &v1.state_root,
                 Self::V2(v2) => &v2.state_root,
                 Self::V3(v3) => &v3.state_root,
-                Self::V4(v4) => &v4.state_root,
             }
         }
 
@@ -902,7 +853,6 @@ pub mod chunk_extra {
                 Self::V1(v1) => &mut v1.state_root,
                 Self::V2(v2) => &mut v2.state_root,
                 Self::V3(v3) => &mut v3.state_root,
-                Self::V4(v4) => &mut v4.state_root,
             }
         }
 
@@ -912,7 +862,6 @@ pub mod chunk_extra {
                 Self::V1(v1) => ValidatorStakeIter::v1(&v1.validator_proposals),
                 Self::V2(v2) => ValidatorStakeIter::new(&v2.validator_proposals),
                 Self::V3(v3) => ValidatorStakeIter::new(&v3.validator_proposals),
-                Self::V4(v4) => ValidatorStakeIter::new(&v4.validator_proposals),
             }
         }
 
@@ -922,7 +871,6 @@ pub mod chunk_extra {
                 Self::V1(v1) => v1.gas_limit,
                 Self::V2(v2) => v2.gas_limit,
                 Self::V3(v3) => v3.gas_limit,
-                Self::V4(v4) => v4.gas_limit,
             }
         }
 
@@ -932,7 +880,6 @@ pub mod chunk_extra {
                 Self::V1(v1) => v1.gas_used,
                 Self::V2(v2) => v2.gas_used,
                 Self::V3(v3) => v3.gas_used,
-                Self::V4(v4) => v4.gas_used,
             }
         }
 
@@ -942,7 +889,6 @@ pub mod chunk_extra {
                 Self::V1(v1) => v1.balance_burnt,
                 Self::V2(v2) => v2.balance_burnt,
                 Self::V3(v3) => v3.balance_burnt,
-                Self::V4(v4) => v4.balance_burnt,
             }
         }
 
@@ -952,15 +898,6 @@ pub mod chunk_extra {
                 Self::V1(_) => None,
                 Self::V2(_) => None,
                 Self::V3(v3) => v3.congestion_info.into(),
-                Self::V4(v4) => v4.congestion_info.into(),
-            }
-        }
-
-        #[inline]
-        pub fn bandwidth_requests(&self) -> Option<&BandwidthRequests> {
-            match self {
-                Self::V1(_) | Self::V2(_) | Self::V3(_) => None,
-                Self::V4(extra) => Some(&extra.bandwidth_requests),
             }
         }
     }

@@ -17,7 +17,7 @@ use near_o11y::testonly::init_integration_logger;
 use near_o11y::WithSpanContextExt;
 use near_primitives::hash::CryptoHash;
 use near_primitives::transaction::SignedTransaction;
-use near_primitives::types::{AccountId, BlockId, BlockReference, ShardIndex};
+use near_primitives::types::{AccountId, BlockId, BlockReference};
 use near_primitives::views::QueryResponseKind::ViewAccount;
 use near_primitives::views::{QueryRequest, QueryResponse};
 use std::collections::HashSet;
@@ -189,11 +189,8 @@ fn test_cross_shard_tx_callback(
             let balances1 = balances;
             let observed_balances1 = observed_balances;
             let presumable_epoch1 = presumable_epoch.clone();
-            // This test uses the V0 shard layout so it's ok to cast ShardId to
-            // ShardIndex.
-            let shard_id = account_id_to_shard_id(&account_id, 8);
-            let shard_index: ShardIndex = shard_id.into();
-            let actor = &connectors_[shard_index + (*presumable_epoch.read().unwrap() * 8) % 24]
+            let actor = &connectors_[account_id_to_shard_id(&account_id, 8) as usize
+                + (*presumable_epoch.read().unwrap() * 8) % 24]
                 .view_client_actor;
             let actor = actor.send(
                 Query::new(
@@ -257,15 +254,10 @@ fn test_cross_shard_tx_callback(
                 let amount = (5 + iteration_local) as u128;
                 let next_nonce = nonce.fetch_add(1, Ordering::Relaxed);
 
-                // This test uses the V0 shard layout so it's ok to cast ShardId to
-                // ShardIndex.
-                let shard_id = account_id_to_shard_id(&validators[from], 8);
-                let shard_index: ShardIndex = shard_id.into();
-
                 send_tx(
                     validators.len(),
                     connectors.clone(),
-                    shard_index,
+                    account_id_to_shard_id(&validators[from], 8) as usize,
                     validators[from].clone(),
                     validators[to].clone(),
                     amount,
@@ -295,14 +287,8 @@ fn test_cross_shard_tx_callback(
                     let presumable_epoch1 = presumable_epoch.clone();
                     let account_id1 = validators[i].clone();
                     let block_stats1 = block_stats.clone();
-
-                    // This test uses the V0 shard layout so it's ok to cast ShardId to
-                    // ShardIndex.
-                    let shard_id = account_id_to_shard_id(&validators[i], 8);
-                    let shard_index: ShardIndex = shard_id.into();
-
-                    let actor = &connectors_
-                        [shard_index + (*presumable_epoch.read().unwrap() * 8) % 24]
+                    let actor = &connectors_[account_id_to_shard_id(&validators[i], 8) as usize
+                        + (*presumable_epoch.read().unwrap() * 8) % 24]
                         .view_client_actor;
                     let actor = actor.send(
                         Query::new(
@@ -355,13 +341,8 @@ fn test_cross_shard_tx_callback(
             let connectors_ = connectors.write().unwrap();
             let connectors1 = connectors.clone();
             let presumable_epoch1 = presumable_epoch.clone();
-
-            // This test uses the V0 shard layout so it's ok to cast ShardId to
-            // ShardIndex.
-            let shard_id = account_id_to_shard_id(&account_id, 8);
-            let shard_index: ShardIndex = shard_id.into();
-
-            let actor = &connectors_[shard_index + (*presumable_epoch.read().unwrap() * 8) % 24]
+            let actor = &connectors_[account_id_to_shard_id(&account_id, 8) as usize
+                + (*presumable_epoch.read().unwrap() * 8) % 24]
                 .view_client_actor;
             let actor = actor.send(
                 Query::new(
@@ -477,9 +458,17 @@ fn test_cross_shard_tx_common(
             }),
         );
         let genesis_block = {
-            let block_reference = BlockReference::BlockId(BlockId::Height(0));
-            let msg = near_client_primitives::types::GetBlock(block_reference);
-            conn[0].view_client_actor.send(msg.with_span_context()).await.unwrap().unwrap()
+            conn[0]
+                .view_client_actor
+                .send(
+                    near_client_primitives::types::GetBlock(BlockReference::BlockId(
+                        BlockId::Height(0),
+                    ))
+                    .with_span_context(),
+                )
+                .await
+                .unwrap()
+                .unwrap()
         };
         *connectors.write().unwrap() = conn;
         let block_hash = genesis_block.header.hash;
@@ -509,12 +498,9 @@ fn test_cross_shard_tx_common(
             let presumable_epoch1 = presumable_epoch.clone();
             let account_id1 = validators[i].clone();
             let block_stats1 = block_stats.clone();
-
-            let shard_id = account_id_to_shard_id(&validators[i], 8);
-            let shard_index: ShardIndex = shard_id.into();
-
-            let actor =
-                &connectors_[shard_index + *presumable_epoch.read().unwrap() * 8].view_client_actor;
+            let actor = &connectors_[account_id_to_shard_id(&validators[i], 8) as usize
+                + *presumable_epoch.read().unwrap() * 8]
+                .view_client_actor;
             let actor = actor.send(
                 Query::new(
                     BlockReference::latest(),
@@ -557,29 +543,34 @@ fn test_cross_shard_tx_common(
 /// Doesn't drop chunks, disabled doomslug, no validator rotation (each epoch
 /// has the same set of validators).
 #[test]
-fn ultra_slow_test_cross_shard_tx() {
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn test_cross_shard_tx() {
     test_cross_shard_tx_common(64, false, false, false, 70, Some(2.3), None);
 }
 
 /// Same as above, but doomslug is enabled.
 #[test]
-fn ultra_slow_test_cross_shard_tx_doomslug() {
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn test_cross_shard_tx_doomslug() {
     test_cross_shard_tx_common(64, false, false, true, 200, None, Some(1.5));
 }
 
 /// Same as the first one but the chunks are sometimes dropped.
 #[test]
-fn ultra_slow_test_cross_shard_tx_drop_chunks() {
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn test_cross_shard_tx_drop_chunks() {
     test_cross_shard_tx_common(64, false, true, false, 250, None, None);
 }
 
 #[test]
-fn ultra_slow_test_cross_shard_tx_8_iterations() {
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn test_cross_shard_tx_8_iterations() {
     test_cross_shard_tx_common(8, false, false, false, 200, Some(2.4), None);
 }
 
 #[test]
-fn ultra_slow_test_cross_shard_tx_8_iterations_drop_chunks() {
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn test_cross_shard_tx_8_iterations_drop_chunks() {
     test_cross_shard_tx_common(8, false, true, false, 200, Some(2.4), None);
 }
 
@@ -589,11 +580,13 @@ fn ultra_slow_test_cross_shard_tx_8_iterations_drop_chunks() {
 /// the allocated time. (the one with lower block production time is expected to
 /// finish fewer because it has higher forkfulness).
 #[test]
-fn ultra_slow_test_cross_shard_tx_with_validator_rotation_1() {
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn test_cross_shard_tx_with_validator_rotation_1() {
     test_cross_shard_tx_common(8, true, false, false, 220, Some(2.4), None);
 }
 
 #[test]
-fn ultra_slow_test_cross_shard_tx_with_validator_rotation_2() {
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn test_cross_shard_tx_with_validator_rotation_2() {
     test_cross_shard_tx_common(24, true, false, false, 400, Some(2.4), None);
 }

@@ -240,64 +240,44 @@ impl TxTracker {
         }
     }
 
-    // Makes sure that there's something written in the DB for this access key.
-    // This function is called before calling initialize_target_nonce(), which sets
-    // in-memory data associated with this nonce. It would make sense to do this part at the same time,
-    // But since we can't hold the lock across awaits, we need to do this separately first if we want to
-    // keep the lock on Self for the entirety of sections of code that make updates to it.
-    //
-    // So this function must be called before calling initialize_target_nonce() for a given access key
-    async fn store_target_nonce(
+    async fn initialize_target_nonce(
+        lock: &Mutex<Self>,
         target_view_client: &Addr<ViewClientActor>,
         db: &DB,
         access_key: &(AccountId, PublicKey),
-    ) -> anyhow::Result<()> {
-        if crate::read_target_nonce(db, &access_key.0, &access_key.1)?.is_some() {
-            return Ok(());
-        }
-        let nonce =
-            crate::fetch_access_key_nonce(target_view_client, &access_key.0, &access_key.1).await?;
-        let t = LatestTargetNonce { nonce, pending_outcomes: HashSet::new() };
-        crate::put_target_nonce(db, &access_key.0, &access_key.1, &t)?;
-
-        Ok(())
-    }
-
-    fn initialize_target_nonce(
-        &mut self,
-        db: &DB,
-        access_key: &(AccountId, PublicKey),
         source_height: Option<BlockHeight>,
     ) -> anyhow::Result<()> {
-        // We unwrap() because store_target_nonce() must be called before calling this function.
-        let t = crate::read_target_nonce(db, &access_key.0, &access_key.1)?.unwrap();
-        let info = NonceInfo {
-            target_nonce: TargetNonce {
-                nonce: t.nonce,
-                pending_outcomes: t
-                    .pending_outcomes
-                    .into_iter()
-                    .map(NonceUpdater::ChainObjectId)
-                    .collect(),
+        let info = match crate::read_target_nonce(db, &access_key.0, &access_key.1)? {
+            Some(t) => NonceInfo {
+                target_nonce: TargetNonce {
+                    nonce: t.nonce,
+                    pending_outcomes: t
+                        .pending_outcomes
+                        .into_iter()
+                        .map(NonceUpdater::ChainObjectId)
+                        .collect(),
+                },
+                last_height: source_height,
+                txs_awaiting_nonce: BTreeSet::new(),
+                queued_txs: BTreeSet::new(),
             },
-            last_height: source_height,
-            txs_awaiting_nonce: BTreeSet::new(),
-            queued_txs: BTreeSet::new(),
+            None => {
+                let nonce =
+                    crate::fetch_access_key_nonce(target_view_client, &access_key.0, &access_key.1)
+                        .await?;
+                let t = LatestTargetNonce { nonce, pending_outcomes: HashSet::new() };
+                crate::put_target_nonce(db, &access_key.0, &access_key.1, &t)?;
+                NonceInfo {
+                    target_nonce: TargetNonce { nonce: t.nonce, pending_outcomes: HashSet::new() },
+                    last_height: source_height,
+                    txs_awaiting_nonce: BTreeSet::new(),
+                    queued_txs: BTreeSet::new(),
+                }
+            }
         };
-        self.nonces.insert(access_key.clone(), info);
+        let mut me = lock.lock().unwrap();
+        me.nonces.insert(access_key.clone(), info);
         Ok(())
-    }
-
-    fn get_target_nonce<'a>(
-        &'a mut self,
-        db: &DB,
-        access_key: &(AccountId, PublicKey),
-        source_height: Option<BlockHeight>,
-    ) -> anyhow::Result<&'a mut NonceInfo> {
-        if !self.nonces.contains_key(access_key) {
-            self.initialize_target_nonce(db, &access_key, source_height)?;
-        }
-        Ok(self.nonces.get_mut(access_key).unwrap())
     }
 
     pub(crate) async fn next_nonce(
@@ -310,9 +290,12 @@ impl TxTracker {
     ) -> anyhow::Result<TargetNonce> {
         let source_height = Some(source_height);
         let access_key = (signer_id.clone(), public_key.clone());
-        Self::store_target_nonce(target_view_client, db, &access_key).await?;
+        if !lock.lock().unwrap().nonces.contains_key(&access_key) {
+            Self::initialize_target_nonce(lock, target_view_client, db, &access_key, source_height)
+                .await?;
+        }
         let mut me = lock.lock().unwrap();
-        let info = me.get_target_nonce(db, &access_key, source_height).unwrap();
+        let info = me.nonces.get_mut(&access_key).unwrap();
         if source_height > info.last_height {
             info.last_height = source_height;
         }
@@ -337,16 +320,16 @@ impl TxTracker {
         secret_key: &SecretKey,
     ) -> anyhow::Result<TargetNonce> {
         let access_key = (signer_id.clone(), public_key.clone());
-        Self::store_target_nonce(target_view_client, db, &access_key).await?;
-        let mut me = lock.lock().unwrap();
-        if !me.nonces.contains_key(&access_key) {
-            me.initialize_target_nonce(db, &access_key, None)?;
+        if !lock.lock().unwrap().nonces.contains_key(&access_key) {
+            Self::initialize_target_nonce(lock, target_view_client, db, &access_key, None).await?;
+            let mut me = lock.lock().unwrap();
             let info = me.nonces.get_mut(&access_key).unwrap();
             if let Some(nonce) = &mut info.target_nonce.nonce {
                 *nonce += 1;
             }
             return Ok(info.target_nonce.clone());
         }
+        let mut me = lock.lock().unwrap();
         let mut first_nonce = None;
         let txs = me.nonces.get(&access_key).unwrap().queued_txs.clone();
         if !txs.is_empty() {
@@ -386,10 +369,9 @@ impl TxTracker {
         &mut chunk.txs[tx_ref.tx_idx]
     }
 
-    // This function sets in-memory info for any access keys that will be touched by this transaction (`tx_ref`).
-    // store_target_nonce() must have been called beforehand for each of these.
-    fn insert_access_key_updates(
-        &mut self,
+    async fn insert_access_key_updates(
+        lock: &Mutex<Self>,
+        target_view_client: &Addr<ViewClientActor>,
         db: &DB,
         tx_ref: &TxRef,
         nonce_updates: &HashSet<(AccountId, PublicKey)>,
@@ -397,7 +379,18 @@ impl TxTracker {
     ) -> anyhow::Result<()> {
         let source_height = Some(source_height);
         for access_key in nonce_updates.iter() {
-            let info = self.get_target_nonce(db, &access_key, source_height).unwrap();
+            if !lock.lock().unwrap().nonces.contains_key(access_key) {
+                Self::initialize_target_nonce(
+                    lock,
+                    target_view_client,
+                    db,
+                    &access_key,
+                    source_height,
+                )
+                .await?;
+            }
+            let mut me = lock.lock().unwrap();
+            let info = me.nonces.get_mut(&access_key).unwrap();
 
             if info.last_height < source_height {
                 info.last_height = source_height;
@@ -405,7 +398,8 @@ impl TxTracker {
             info.target_nonce.pending_outcomes.insert(NonceUpdater::TxRef(tx_ref.clone()));
         }
         if !nonce_updates.is_empty() {
-            assert!(self
+            let mut me = lock.lock().unwrap();
+            assert!(me
                 .updater_to_keys
                 .insert(NonceUpdater::TxRef(tx_ref.clone()), nonce_updates.clone())
                 .is_none());
@@ -413,39 +407,28 @@ impl TxTracker {
         Ok(())
     }
 
-    async fn store_access_key_updates(
-        block: &MappedBlock,
-        target_view_client: &Addr<ViewClientActor>,
-        db: &DB,
-    ) -> anyhow::Result<()> {
-        for c in block.chunks.iter() {
-            for tx in c.txs.iter() {
-                let updates = match tx {
-                    crate::TargetChainTx::Ready(tx) => &tx.nonce_updates,
-                    crate::TargetChainTx::AwaitingNonce(tx) => &tx.nonce_updates,
-                };
-                for access_key in updates.iter() {
-                    Self::store_target_nonce(target_view_client, db, access_key).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn queue_txs(&mut self, block: &MappedBlock, db: &DB) -> anyhow::Result<()> {
-        self.height_queued = Some(block.source_height);
-        self.next_heights.pop_front().unwrap();
+    // This is the non-async portion of queue_block() that returns a list of access key updates we need
+    // to call insert_access_key_updates() for, which we'll do after calling this function. Otherwise
+    // we would have to lock and unlock the mutex on every transaction to avoid holding it across await points
+    fn queue_txs<'a>(
+        lock: &Mutex<Self>,
+        block: &'a MappedBlock,
+    ) -> anyhow::Result<Vec<(TxRef, &'a HashSet<(AccountId, PublicKey)>)>> {
+        let mut nonce_updates = Vec::new();
+        let mut me = lock.lock().unwrap();
+        me.height_queued = Some(block.source_height);
+        me.next_heights.pop_front().unwrap();
 
         for c in block.chunks.iter() {
             if !c.txs.is_empty() {
-                self.nonempty_height_queued = Some(block.source_height);
+                me.nonempty_height_queued = Some(block.source_height);
             }
             for (tx_idx, tx) in c.txs.iter().enumerate() {
                 let tx_ref =
                     TxRef { source_height: block.source_height, shard_id: c.shard_id, tx_idx };
                 match tx {
                     crate::TargetChainTx::Ready(tx) => {
-                        let info = self
+                        let info = me
                             .nonces
                             .get_mut(&(
                                 tx.target_tx.transaction.signer_id().clone(),
@@ -453,15 +436,12 @@ impl TxTracker {
                             ))
                             .unwrap();
                         info.queued_txs.insert(tx_ref.clone());
-                        self.insert_access_key_updates(
-                            db,
-                            &tx_ref,
-                            &tx.nonce_updates,
-                            block.source_height,
-                        )?;
+                        if !tx.nonce_updates.is_empty() {
+                            nonce_updates.push((tx_ref, &tx.nonce_updates));
+                        }
                     }
                     crate::TargetChainTx::AwaitingNonce(tx) => {
-                        let info = self
+                        let info = me
                             .nonces
                             .get_mut(&(
                                 tx.target_tx.signer_id().clone(),
@@ -470,17 +450,14 @@ impl TxTracker {
                             .unwrap();
                         info.txs_awaiting_nonce.insert(tx_ref.clone());
                         info.queued_txs.insert(tx_ref.clone());
-                        self.insert_access_key_updates(
-                            db,
-                            &tx_ref,
-                            &tx.nonce_updates,
-                            block.source_height,
-                        )?;
+                        if !tx.nonce_updates.is_empty() {
+                            nonce_updates.push((tx_ref, &tx.nonce_updates));
+                        }
                     }
                 };
             }
         }
-        Ok(())
+        Ok(nonce_updates)
     }
 
     pub(crate) async fn queue_block(
@@ -490,9 +467,18 @@ impl TxTracker {
         target_view_client: &Addr<ViewClientActor>,
         db: &DB,
     ) -> anyhow::Result<()> {
-        Self::store_access_key_updates(&block, target_view_client, db).await?;
-        let mut me = lock.lock().unwrap();
-        me.queue_txs(&block, db)?;
+        let key_updates = Self::queue_txs(lock, &block)?;
+        for (tx_ref, nonce_updates) in key_updates {
+            Self::insert_access_key_updates(
+                lock,
+                target_view_client,
+                db,
+                &tx_ref,
+                nonce_updates,
+                block.source_height,
+            )
+            .await?;
+        }
         tx_block_queue.lock().unwrap().push_back(block);
         Ok(())
     }

@@ -8,7 +8,6 @@ use near_crypto::SecretKey;
 use near_network::raw::{DirectMessage, Listener, Message, RoutedMessage};
 use near_network::tcp;
 use near_network::types::{PartialEncodedChunkRequestMsg, PartialEncodedChunkResponseMsg};
-use near_primitives::shard_layout::ShardLayout;
 use near_primitives::sharding::ChunkHash;
 use near_primitives::types::{BlockHeight, ShardId};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -107,7 +106,7 @@ fn retrieve_starting_chunk_hash(
             .chain_store()
             .get_block_hash_by_height(height)
             .and_then(|hash| chain.chain_store().get_block(&hash))
-            .map(|block| block.chunks().iter_deprecated().next().unwrap().chunk_hash())
+            .map(|block| block.chunks().iter().next().unwrap().chunk_hash())
         {
             Ok(hash) => return Ok(hash),
             Err(e) => {
@@ -181,9 +180,7 @@ impl IncomingRequests {
                                 PartialEncodedChunkRequestMsg {
                                     chunk_hash,
                                     part_ords: vec![0],
-                                    tracking_shards: [ShardId::new(0)]
-                                        .into_iter()
-                                        .collect::<HashSet<_>>(),
+                                    tracking_shards: std::iter::once(0).collect::<HashSet<_>>(),
                                 },
                             )),
                         });
@@ -295,7 +292,7 @@ impl MockPeer {
         chain_id: String,
         archival: bool,
         block_production_delay: Duration,
-        shard_layout: ShardLayout,
+        num_shards: ShardId,
         network_start_height: BlockHeight,
         network_config: MockNetworkConfig,
     ) -> anyhow::Result<Self> {
@@ -305,7 +302,7 @@ impl MockPeer {
             &chain_id,
             *chain.genesis().hash(),
             network_start_height,
-            shard_layout.shard_ids().collect(),
+            (0..num_shards).collect(),
             archival,
             30 * near_time::Duration::SECOND,
         )

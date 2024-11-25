@@ -8,10 +8,7 @@ mod proto_conv;
 mod state_sync;
 pub use edge::*;
 use near_primitives::stateless_validation::chunk_endorsement::ChunkEndorsement;
-use near_primitives::stateless_validation::contract_distribution::ChunkContractAccesses;
-use near_primitives::stateless_validation::contract_distribution::ContractCodeRequest;
-use near_primitives::stateless_validation::contract_distribution::ContractCodeResponse;
-use near_primitives::stateless_validation::contract_distribution::PartialEncodedContractDeploys;
+use near_primitives::stateless_validation::chunk_endorsement::ChunkEndorsementV1;
 use near_primitives::stateless_validation::partial_witness::PartialEncodedStateWitness;
 use near_primitives::stateless_validation::state_witness::ChunkStateWitnessAck;
 pub use peer::*;
@@ -194,7 +191,7 @@ impl VersionedAccountData {
                 MAX_ACCOUNT_DATA_SIZE_BYTES
             );
         }
-        let signature = signer.sign_bytes(&payload);
+        let signature = signer.sign_account_key_payload(&payload);
         Ok(SignedAccountData {
             account_data: self,
             payload: AccountKeySignedPayload { payload, signature },
@@ -273,7 +270,7 @@ impl OwnedAccount {
             "OwnedAccount.account_key doesn't match the signer's account_key"
         );
         let payload = proto::AccountKeyPayload::from(&self).write_to_bytes().unwrap();
-        let signature = signer.sign_bytes(&payload);
+        let signature = signer.sign_account_key_payload(&payload);
         SignedOwnedAccount {
             owned_account: self,
             payload: AccountKeySignedPayload { payload, signature },
@@ -439,15 +436,12 @@ pub enum PeerMessage {
 
     /// Gracefully disconnect from other peer.
     Disconnect(Disconnect),
-    Challenge(Box<Challenge>),
+    Challenge(Challenge),
 
     SyncSnapshotHosts(SyncSnapshotHosts),
     StateRequestHeader(ShardId, CryptoHash),
     StateRequestPart(ShardId, CryptoHash, u64),
     VersionedStateResponse(StateResponseInfo),
-
-    EpochSyncRequest,
-    EpochSyncResponse(CompressedEpochSyncProof),
 }
 
 impl fmt::Display for PeerMessage {
@@ -551,19 +545,15 @@ pub enum RoutedMessageBody {
     _UnusedVersionedStateResponse,
     PartialEncodedChunkForward(PartialEncodedChunkForwardMsg),
     _UnusedChunkStateWitness,
-    _UnusedChunkEndorsement,
+    /// TODO(ChunkEndorsementV2): Deprecate once we move to VersionedChunkEndorsement
+    ChunkEndorsement(ChunkEndorsementV1),
     ChunkStateWitnessAck(ChunkStateWitnessAck),
     PartialEncodedStateWitness(PartialEncodedStateWitness),
     PartialEncodedStateWitnessForward(PartialEncodedStateWitness),
     VersionedChunkEndorsement(ChunkEndorsement),
-    /// Not used, but needed for borsh backward compatibility.
-    _UnusedEpochSyncRequest,
-    _UnusedEpochSyncResponse(CompressedEpochSyncProof),
+    EpochSyncRequest,
+    EpochSyncResponse(CompressedEpochSyncProof),
     StatePartRequest(StatePartRequest),
-    ChunkContractAccesses(ChunkContractAccesses),
-    ContractCodeRequest(ContractCodeRequest),
-    ContractCodeResponse(ContractCodeResponse),
-    PartialEncodedContractDeploys(PartialEncodedContractDeploys),
 }
 
 impl RoutedMessageBody {
@@ -586,7 +576,8 @@ impl RoutedMessageBody {
     // we may be the block_producer.
     pub fn allow_sending_to_self(&self) -> bool {
         match self {
-            RoutedMessageBody::PartialEncodedStateWitness(_)
+            RoutedMessageBody::ChunkEndorsement(_)
+            | RoutedMessageBody::PartialEncodedStateWitness(_)
             | RoutedMessageBody::PartialEncodedStateWitnessForward(_)
             | RoutedMessageBody::VersionedChunkEndorsement(_) => true,
             _ => false,
@@ -639,7 +630,7 @@ impl fmt::Debug for RoutedMessageBody {
             RoutedMessageBody::Pong(_) => write!(f, "Pong"),
             RoutedMessageBody::_UnusedVersionedStateResponse => write!(f, "VersionedStateResponse"),
             RoutedMessageBody::_UnusedChunkStateWitness => write!(f, "ChunkStateWitness"),
-            RoutedMessageBody::_UnusedChunkEndorsement => write!(f, "ChunkEndorsement"),
+            RoutedMessageBody::ChunkEndorsement(_) => write!(f, "ChunkEndorsement"),
             RoutedMessageBody::ChunkStateWitnessAck(ack, ..) => {
                 f.debug_tuple("ChunkStateWitnessAck").field(&ack.chunk_hash).finish()
             }
@@ -652,21 +643,11 @@ impl fmt::Debug for RoutedMessageBody {
             RoutedMessageBody::VersionedChunkEndorsement(_) => {
                 write!(f, "VersionedChunkEndorsement")
             }
-            RoutedMessageBody::_UnusedEpochSyncRequest => write!(f, "EpochSyncRequest"),
-            RoutedMessageBody::_UnusedEpochSyncResponse(_) => {
+            RoutedMessageBody::EpochSyncRequest => write!(f, "EpochSyncRequest"),
+            RoutedMessageBody::EpochSyncResponse(_) => {
                 write!(f, "EpochSyncResponse")
             }
             RoutedMessageBody::StatePartRequest(_) => write!(f, "StatePartRequest"),
-            RoutedMessageBody::ChunkContractAccesses(accesses) => {
-                write!(f, "ChunkContractAccesses(code_hashes={:?})", accesses.contracts())
-            }
-            RoutedMessageBody::ContractCodeRequest(request) => {
-                write!(f, "ContractCodeRequest(code_hashes={:?})", request.contracts())
-            }
-            RoutedMessageBody::ContractCodeResponse(_) => write!(f, "ContractCodeResponse",),
-            RoutedMessageBody::PartialEncodedContractDeploys(deploys) => {
-                write!(f, "PartialEncodedContractDeploys(part={:?}", deploys.part())
-            }
         }
     }
 }
@@ -752,6 +733,7 @@ impl RoutedMessage {
             RoutedMessageBody::Ping(_)
                 | RoutedMessageBody::TxStatusRequest(_, _)
                 | RoutedMessageBody::PartialEncodedChunkRequest(_)
+                | RoutedMessageBody::EpochSyncRequest
         )
     }
 
@@ -893,8 +875,8 @@ pub struct StateResponseInfoV2 {
     PartialEq, Eq, Clone, Debug, borsh::BorshSerialize, borsh::BorshDeserialize, ProtocolSchema,
 )]
 pub enum StateResponseInfo {
-    V1(Box<StateResponseInfoV1>),
-    V2(Box<StateResponseInfoV2>),
+    V1(StateResponseInfoV1),
+    V2(StateResponseInfoV2),
 }
 
 impl StateResponseInfo {

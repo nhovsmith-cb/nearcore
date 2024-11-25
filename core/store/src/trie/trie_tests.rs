@@ -6,7 +6,7 @@ use assert_matches::assert_matches;
 use near_primitives::challenge::PartialState;
 use near_primitives::errors::{MissingTrieValueContext, StorageError};
 use near_primitives::hash::{hash, CryptoHash};
-use near_primitives::shard_layout::{ShardLayout, ShardUId};
+use near_primitives::shard_layout::ShardUId;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -100,10 +100,8 @@ where
 fn test_reads_with_incomplete_storage() {
     let mut rng = rand::thread_rng();
     for _ in 0..50 {
-        let shard_layout = ShardLayout::multi_shard(2, 1);
-        let shard_uid = shard_layout.shard_uids().next().unwrap();
-
-        let tries = TestTriesBuilder::new().with_shard_layout(shard_layout).build();
+        let tries = TestTriesBuilder::new().with_shard_layout(1, 2).build();
+        let shard_uid = ShardUId { version: 1, shard_id: 0 };
         let trie_changes = gen_changes(&mut rng, 20);
         let trie_changes = simplify_changes(&trie_changes);
         if trie_changes.is_empty() {
@@ -205,18 +203,16 @@ mod nodes_counter_tests {
 #[cfg(test)]
 mod trie_storage_tests {
     use super::*;
-    use crate::adapter::trie_store::TrieStoreAdapter;
-    use crate::adapter::StoreAdapter;
     use crate::test_utils::create_test_store;
     use crate::trie::accounting_cache::TrieAccountingCache;
     use crate::trie::trie_storage::{TrieCache, TrieCachingStorage, TrieDBStorage};
     use crate::trie::TrieRefcountAddition;
-    use crate::{TrieChanges, TrieConfig, TrieIterator};
+    use crate::{Store, TrieChanges, TrieConfig, TrieIterator};
     use assert_matches::assert_matches;
     use near_o11y::testonly::init_test_logger;
     use near_primitives::hash::hash;
 
-    fn create_store_with_values(values: &[Vec<u8>], shard_uid: ShardUId) -> TrieStoreAdapter {
+    fn create_store_with_values(values: &[Vec<u8>], shard_uid: ShardUId) -> Store {
         let tries = TestTriesBuilder::new().build();
         let mut trie_changes = TrieChanges::empty(Trie::EMPTY_ROOT);
         trie_changes.insertions = values
@@ -230,7 +226,7 @@ mod trie_storage_tests {
         let mut store_update = tries.store_update();
         tries.apply_all(&trie_changes, shard_uid, &mut store_update);
         store_update.commit().unwrap();
-        tries.store()
+        tries.get_store()
     }
 
     /// Put item into storage. Check that it is retrieved correctly.
@@ -280,7 +276,7 @@ mod trie_storage_tests {
         let shard_uid = ShardUId::single_shard();
         let store = create_test_store();
         let trie_caching_storage = TrieCachingStorage::new(
-            store.trie_store(),
+            store,
             TrieCache::new(&TrieConfig::default(), shard_uid, false),
             shard_uid,
             false,

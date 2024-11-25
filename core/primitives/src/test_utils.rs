@@ -352,25 +352,6 @@ impl SignedTransaction {
             0,
         )
     }
-
-    pub fn add_key(
-        nonce: Nonce,
-        signer_id: AccountId,
-        signer: &Signer,
-        public_key: PublicKey,
-        access_key: AccessKey,
-        block_hash: CryptoHash,
-    ) -> Self {
-        Self::from_actions(
-            nonce,
-            signer_id.clone(),
-            signer_id,
-            signer,
-            vec![Action::AddKey(Box::new(AddKeyAction { public_key, access_key }))],
-            block_hash,
-            0,
-        )
-    }
 }
 
 impl BlockHeader {
@@ -400,12 +381,11 @@ impl BlockHeader {
     }
 
     pub fn resign(&mut self, signer: &ValidatorSigner) {
-        let hash = BlockHeader::compute_hash(
+        let (hash, signature) = signer.sign_block_header_parts(
             *self.prev_hash(),
             &self.inner_lite_bytes(),
             &self.inner_rest_bytes(),
         );
-        let signature = signer.sign_bytes(hash.as_ref());
         match self {
             BlockHeader::BlockHeaderV1(header) => {
                 let header = Arc::make_mut(header);
@@ -848,7 +828,7 @@ impl TestBlockBuilder {
             self.prev.header(),
             self.height,
             self.prev.header().block_ordinal() + 1,
-            self.prev.chunks().iter_deprecated().cloned().collect(),
+            self.prev.chunks().iter().cloned().collect(),
             vec![vec![]; self.prev.chunks().len()],
             self.epoch_id,
             self.next_epoch_id,
@@ -1031,7 +1011,7 @@ impl EpochInfoProvider for MockEpochInfoProvider {
         _account_id: &AccountId,
         _epoch_id: &EpochId,
     ) -> Result<ShardId, EpochError> {
-        Ok(ShardId::new(0))
+        Ok(0)
     }
 }
 

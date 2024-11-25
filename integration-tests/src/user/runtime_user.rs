@@ -2,13 +2,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use itertools::Itertools;
 use near_chain_configs::MIN_GAS_PRICE;
 use near_crypto::{PublicKey, Signer};
 use near_jsonrpc_primitives::errors::ServerError;
 use near_parameters::RuntimeConfig;
-use near_primitives::apply::ApplyChunkReason;
-use near_primitives::bandwidth_scheduler::BlockBandwidthRequests;
 use near_primitives::congestion_info::{BlockCongestionInfo, ExtendedCongestionInfo};
 use near_primitives::errors::{RuntimeError, TxExecutionError};
 use near_primitives::hash::CryptoHash;
@@ -16,14 +13,13 @@ use near_primitives::receipt::Receipt;
 use near_primitives::runtime::migration_data::{MigrationData, MigrationFlags};
 use near_primitives::test_utils::MockEpochInfoProvider;
 use near_primitives::transaction::SignedTransaction;
-use near_primitives::types::{AccountId, BlockHeightDelta, MerkleHash, ShardId};
+use near_primitives::types::{AccountId, BlockHeightDelta, MerkleHash};
 use near_primitives::version::{ProtocolFeature, PROTOCOL_VERSION};
 use near_primitives::views::{
     AccessKeyView, AccountView, BlockView, CallResult, ChunkView, ContractCodeView,
     ExecutionOutcomeView, ExecutionOutcomeWithIdView, ExecutionStatusView,
     FinalExecutionOutcomeView, FinalExecutionStatus, ViewStateResult,
 };
-use near_store::adapter::StoreUpdateAdapter;
 use near_store::{ShardTries, TrieUpdate};
 use node_runtime::state_viewer::TrieViewer;
 use node_runtime::{state_viewer::ViewApplyState, ApplyState, Runtime};
@@ -140,7 +136,7 @@ impl RuntimeUser {
             );
             if use_flat_storage {
                 near_store::flat::FlatStateChanges::from_state_changes(&apply_result.state_changes)
-                    .apply_to_flat_state(&mut update.flat_store_update(), ShardUId::single_shard());
+                    .apply_to_flat_state(&mut update, ShardUId::single_shard());
             }
             update.commit().unwrap();
             client.state_root = apply_result.state_root;
@@ -157,9 +153,9 @@ impl RuntimeUser {
 
     fn apply_state(&self) -> ApplyState {
         // TODO(congestion_control) - Set shard id somehow.
-        let shard_id = ShardId::new(0);
+        let shard_id = 0;
         // TODO(congestion_control) - Set other shard ids somehow.
-        let all_shard_ids = [0, 1, 2, 3, 4, 5].into_iter().map(ShardId::new).collect_vec();
+        let all_shard_ids = [0, 1, 2, 3, 4, 5];
         let congestion_info = if ProtocolFeature::CongestionControl.enabled(PROTOCOL_VERSION) {
             all_shard_ids.into_iter().map(|id| (id, ExtendedCongestionInfo::default())).collect()
         } else {
@@ -168,7 +164,7 @@ impl RuntimeUser {
         let congestion_info = BlockCongestionInfo::new(congestion_info);
 
         ApplyState {
-            apply_reason: ApplyChunkReason::UpdateTrackedShard,
+            apply_reason: None,
             block_height: 1,
             prev_block_hash: Default::default(),
             block_hash: Default::default(),
@@ -186,7 +182,6 @@ impl RuntimeUser {
             migration_data: Arc::new(MigrationData::default()),
             migration_flags: MigrationFlags::default(),
             congestion_info,
-            bandwidth_requests: BlockBandwidthRequests::empty(),
         }
     }
 
@@ -215,48 +210,43 @@ impl RuntimeUser {
     }
 
     // TODO(#10942) get rid of copy pasted code, it's outdated comparing to the original
-    fn get_final_transaction_result(&self, hash: &CryptoHash) -> Option<FinalExecutionOutcomeView> {
+    fn get_final_transaction_result(&self, hash: &CryptoHash) -> FinalExecutionOutcomeView {
         let mut outcomes = self.get_recursive_transaction_results(hash);
         let mut looking_for_id = *hash;
         let num_outcomes = outcomes.len();
-        let status = outcomes.iter().find_map(|outcome_with_id| {
-            if outcome_with_id.id == looking_for_id {
-                match &outcome_with_id.outcome.status {
-                    ExecutionStatusView::Unknown if num_outcomes == 1 => {
-                        Some(FinalExecutionStatus::NotStarted)
+        let status = outcomes
+            .iter()
+            .find_map(|outcome_with_id| {
+                if outcome_with_id.id == looking_for_id {
+                    match &outcome_with_id.outcome.status {
+                        ExecutionStatusView::Unknown if num_outcomes == 1 => {
+                            Some(FinalExecutionStatus::NotStarted)
+                        }
+                        ExecutionStatusView::Unknown => Some(FinalExecutionStatus::Started),
+                        ExecutionStatusView::Failure(e) => {
+                            Some(FinalExecutionStatus::Failure(e.clone()))
+                        }
+                        ExecutionStatusView::SuccessValue(v) => {
+                            Some(FinalExecutionStatus::SuccessValue(v.clone()))
+                        }
+                        ExecutionStatusView::SuccessReceiptId(id) => {
+                            looking_for_id = *id;
+                            None
+                        }
                     }
-                    ExecutionStatusView::Unknown => Some(FinalExecutionStatus::Started),
-                    ExecutionStatusView::Failure(e) => {
-                        Some(FinalExecutionStatus::Failure(e.clone()))
-                    }
-                    ExecutionStatusView::SuccessValue(v) => {
-                        Some(FinalExecutionStatus::SuccessValue(v.clone()))
-                    }
-                    ExecutionStatusView::SuccessReceiptId(id) => {
-                        looking_for_id = *id;
-                        None
-                    }
+                } else {
+                    None
                 }
-            } else {
-                None
-            }
-        });
-        let status = if cfg!(feature = "protocol_feature_relaxed_chunk_validation") {
-            // If we don't find the transaction at all, it must have been ignored due to having
-            // been an invalid transaction (but due to relaxed validation we do not invalidate the
-            // entire chunk.)
-            status?
-        } else {
-            status.expect("results should resolve to a final outcome")
-        };
+            })
+            .expect("results should resolve to a final outcome");
         let receipts = outcomes.split_off(1);
         let transaction = self.transactions.borrow().get(hash).unwrap().clone().into();
-        Some(FinalExecutionOutcomeView {
+        FinalExecutionOutcomeView {
             status,
             transaction,
             transaction_outcome: outcomes.pop().unwrap(),
             receipts_outcome: receipts,
-        })
+        }
     }
 }
 
@@ -302,7 +292,7 @@ impl User for RuntimeUser {
         args: &[u8],
     ) -> Result<CallResult, String> {
         // TODO(congestion_control) - Set shard id somehow.
-        let shard_id = ShardId::new(0);
+        let shard_id = 0;
 
         let apply_state = self.apply_state();
         let client = self.client.read().expect(POISONED_LOCK_ERR);
@@ -312,7 +302,7 @@ impl User for RuntimeUser {
             block_height: apply_state.block_height,
             prev_block_hash: apply_state.prev_block_hash,
             block_hash: apply_state.block_hash,
-            shard_id,
+            shard_id: shard_id,
             epoch_id: apply_state.epoch_id,
             epoch_height: apply_state.epoch_height,
             block_timestamp: apply_state.block_timestamp,
@@ -342,11 +332,9 @@ impl User for RuntimeUser {
     fn commit_transaction(
         &self,
         transaction: SignedTransaction,
-    ) -> Result<FinalExecutionOutcomeView, super::CommitError> {
-        self.apply_all(self.apply_state(), vec![], vec![transaction.clone()], true)
-            .map_err(super::CommitError::Server)?;
-        self.get_transaction_final_result(&transaction.get_hash())
-            .ok_or(super::CommitError::OutcomeNotFound)
+    ) -> Result<FinalExecutionOutcomeView, ServerError> {
+        self.apply_all(self.apply_state(), vec![], vec![transaction.clone()], true)?;
+        Ok(self.get_transaction_final_result(&transaction.get_hash()))
     }
 
     fn add_receipts(
@@ -375,7 +363,7 @@ impl User for RuntimeUser {
         None
     }
 
-    fn get_chunk_by_height(&self, _height: u64, _shard_id: ShardId) -> Option<ChunkView> {
+    fn get_chunk_by_height(&self, _height: u64, _shard_id: u64) -> Option<ChunkView> {
         unimplemented!("get_chunk should not be implemented for RuntimeUser");
     }
 
@@ -383,7 +371,7 @@ impl User for RuntimeUser {
         self.transaction_results.borrow().get(hash).cloned()
     }
 
-    fn get_transaction_final_result(&self, hash: &CryptoHash) -> Option<FinalExecutionOutcomeView> {
+    fn get_transaction_final_result(&self, hash: &CryptoHash) -> FinalExecutionOutcomeView {
         self.get_final_transaction_result(hash)
     }
 

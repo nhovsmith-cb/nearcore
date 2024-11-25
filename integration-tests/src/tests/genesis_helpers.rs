@@ -1,4 +1,3 @@
-use near_async::messaging::{noop, IntoMultiSender};
 use near_async::time::Clock;
 use near_chain::rayon_spawner::RayonAsyncComputationSpawner;
 use near_chain::types::ChainConfig;
@@ -25,7 +24,7 @@ fn genesis_header(genesis: &Genesis) -> BlockHeader {
     let store = create_test_store();
     initialize_genesis_state(store.clone(), genesis, None);
     let chain_genesis = ChainGenesis::new(&genesis.config);
-    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config, None);
+    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config);
     let shard_tracker = ShardTracker::new_empty(epoch_manager.clone());
     let runtime =
         NightshadeRuntime::test(dir.path(), store, &genesis.config, epoch_manager.clone());
@@ -40,7 +39,6 @@ fn genesis_header(genesis: &Genesis) -> BlockHeader {
         None,
         Arc::new(RayonAsyncComputationSpawner),
         MutableConfigValue::new(None, "validator_signer"),
-        noop().into_multi_sender(),
     )
     .unwrap();
     chain.genesis().clone()
@@ -52,7 +50,7 @@ pub fn genesis_block(genesis: &Genesis) -> Block {
     let store = create_test_store();
     initialize_genesis_state(store.clone(), genesis, None);
     let chain_genesis = ChainGenesis::new(&genesis.config);
-    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config, None);
+    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config);
     let shard_tracker = ShardTracker::new_empty(epoch_manager.clone());
     let runtime =
         NightshadeRuntime::test(dir.path(), store, &genesis.config, epoch_manager.clone());
@@ -67,7 +65,6 @@ pub fn genesis_block(genesis: &Genesis) -> Block {
         None,
         Arc::new(RayonAsyncComputationSpawner),
         MutableConfigValue::new(None, "validator_signer"),
-        noop().into_multi_sender(),
     )
     .unwrap();
     chain.get_block(&chain.genesis().hash().clone()).unwrap()

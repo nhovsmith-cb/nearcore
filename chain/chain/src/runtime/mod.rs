@@ -37,7 +37,6 @@ use near_primitives::views::{
     AccessKeyInfoView, CallResult, ContractCodeView, QueryRequest, QueryResponse,
     QueryResponseKind, ViewStateResult,
 };
-use near_store::adapter::{StoreAdapter, StoreUpdateAdapter};
 use near_store::config::StateSnapshotType;
 use near_store::flat::FlatStorageManager;
 use near_store::metadata::DbKind;
@@ -100,11 +99,10 @@ impl NightshadeRuntime {
 
         let runtime = Runtime::new();
         let trie_viewer = TrieViewer::new(trie_viewer_state_size_limit, max_gas_burnt_view);
-        let flat_storage_manager = FlatStorageManager::new(store.flat_store());
-        let epoch_config = epoch_manager.read().get_epoch_config(genesis_config.protocol_version);
-        let shard_uids: Vec<_> = epoch_config.shard_layout.shard_uids().collect();
+        let flat_storage_manager = FlatStorageManager::new(store.clone());
+        let shard_uids: Vec<_> = genesis_config.shard_layout.shard_uids().collect();
         let tries = ShardTries::new(
-            store.trie_store(),
+            store.clone(),
             trie_config,
             &shard_uids,
             flat_storage_manager,
@@ -114,7 +112,7 @@ impl NightshadeRuntime {
             let epoch_manager = epoch_manager.read();
             let epoch_id = epoch_manager.get_epoch_id(&prev_block_hash)?;
             let shard_layout = epoch_manager.get_shard_layout(&epoch_id)?;
-            Ok(shard_layout.shard_uids().enumerate().collect())
+            Ok(shard_layout.shard_uids().collect())
         }) {
             tracing::debug!(target: "runtime", ?err, "The state snapshot is not available.");
         }
@@ -216,9 +214,11 @@ impl NightshadeRuntime {
         prev_hash: &CryptoHash,
     ) -> Result<ShardUId, Error> {
         let epoch_manager = self.epoch_manager.read();
-        let epoch_id = epoch_manager.get_epoch_id_from_prev_block(prev_hash)?;
-        let shard_version = epoch_manager.get_shard_layout(&epoch_id)?.version();
-        Ok(ShardUId::new(shard_version, shard_id))
+        let epoch_id =
+            epoch_manager.get_epoch_id_from_prev_block(prev_hash).map_err(Error::from)?;
+        let shard_version =
+            epoch_manager.get_shard_layout(&epoch_id).map_err(Error::from)?.version();
+        Ok(ShardUId { version: shard_version, shard_id: shard_id as u32 })
     }
 
     fn get_shard_uid_from_epoch_id(
@@ -227,8 +227,9 @@ impl NightshadeRuntime {
         epoch_id: &EpochId,
     ) -> Result<ShardUId, Error> {
         let epoch_manager = self.epoch_manager.read();
-        let shard_version = epoch_manager.get_shard_layout(epoch_id)?.version();
-        Ok(ShardUId::new(shard_version, shard_id))
+        let shard_version =
+            epoch_manager.get_shard_layout(epoch_id).map_err(Error::from)?.version();
+        Ok(ShardUId { version: shard_version, shard_id: shard_id as u32 })
     }
 
     fn account_id_to_shard_uid(
@@ -237,7 +238,7 @@ impl NightshadeRuntime {
         epoch_id: &EpochId,
     ) -> Result<ShardUId, Error> {
         let epoch_manager = self.epoch_manager.read();
-        let shard_layout = epoch_manager.get_shard_layout(epoch_id)?;
+        let shard_layout = epoch_manager.get_shard_layout(epoch_id).map_err(Error::from)?;
         let shard_id = account_id_to_shard_id(account_id, &shard_layout);
         Ok(ShardUId::from_shard_id_and_layout(shard_id, &shard_layout))
     }
@@ -263,7 +264,6 @@ impl NightshadeRuntime {
             challenges_result,
             random_seed,
             congestion_info,
-            bandwidth_requests,
         } = block;
         let ApplyChunkShardContext {
             shard_id,
@@ -364,7 +364,7 @@ impl NightshadeRuntime {
         );
 
         let apply_state = ApplyState {
-            apply_reason,
+            apply_reason: Some(apply_reason),
             block_height,
             prev_block_hash: *prev_block_hash,
             block_hash,
@@ -385,7 +385,6 @@ impl NightshadeRuntime {
                 is_first_block_with_chunk_of_version,
             },
             congestion_info,
-            bandwidth_requests,
         };
 
         let instant = Instant::now();
@@ -462,12 +461,52 @@ impl NightshadeRuntime {
             processed_yield_timeouts: apply_result.processed_yield_timeouts,
             applied_receipts_hash: hash(&borsh::to_vec(receipts).unwrap()),
             congestion_info: apply_result.congestion_info,
-            bandwidth_requests: apply_result.bandwidth_requests,
-            bandwidth_scheduler_state_hash: apply_result.bandwidth_scheduler_state_hash,
-            contract_updates: apply_result.contract_updates,
         };
 
         Ok(result)
+    }
+
+    fn precompile_contracts(
+        &self,
+        epoch_id: &EpochId,
+        contract_codes: Vec<ContractCode>,
+    ) -> Result<(), Error> {
+        let _span = tracing::debug_span!(
+            target: "runtime",
+            "precompile_contracts",
+            num_contracts = contract_codes.len())
+        .entered();
+        let protocol_version = self.epoch_manager.get_epoch_protocol_version(epoch_id)?;
+        let runtime_config = self.runtime_config_store.get_config(protocol_version);
+        let compiled_contract_cache: Option<Box<dyn ContractRuntimeCache>> =
+            Some(Box::new(self.compiled_contract_cache.handle()));
+        // Execute precompile_contract in parallel but prevent it from using more than half of all
+        // threads so that node will still function normally.
+        rayon::scope(|scope| {
+            let (slot_sender, slot_receiver) = std::sync::mpsc::channel();
+            // Use up-to half of the threads for the compilation.
+            let max_threads = std::cmp::max(rayon::current_num_threads() / 2, 1);
+            for _ in 0..max_threads {
+                slot_sender.send(()).expect("both sender and receiver are owned here");
+            }
+            for code in contract_codes {
+                slot_receiver.recv().expect("could not receive a slot to compile contract");
+                let contract_cache = compiled_contract_cache.as_deref();
+                let slot_sender = slot_sender.clone();
+                scope.spawn(move |_| {
+                    precompile_contract(
+                        &code,
+                        Arc::clone(&runtime_config.wasm_config),
+                        contract_cache,
+                    )
+                    .ok();
+                    // If this fails, it just means there won't be any more attempts to recv the
+                    // slots
+                    let _ = slot_sender.send(());
+                });
+            }
+        });
+        Ok(())
     }
 
     fn get_gc_stop_height_impl(&self, block_hash: &CryptoHash) -> Result<BlockHeight, Error> {
@@ -522,7 +561,7 @@ impl NightshadeRuntime {
             target: "runtime",
             "obtain_state_part",
             part_id = part_id.idx,
-            ?shard_id,
+            shard_id,
             %prev_hash,
             num_parts = part_id.total)
         .entered();
@@ -909,7 +948,7 @@ impl RuntimeAdapter for NightshadeRuntime {
         }
     }
 
-    #[instrument(target = "runtime", level = "info", skip_all, fields(shard_id = ?chunk.shard_id))]
+    #[instrument(target = "runtime", level = "info", skip_all, fields(shard_id = chunk.shard_id))]
     fn apply_chunk(
         &self,
         storage_config: RuntimeStorageConfig,
@@ -1147,7 +1186,7 @@ impl RuntimeAdapter for NightshadeRuntime {
             target: "runtime",
             "obtain_state_part",
             part_id = part_id.idx,
-            ?shard_id,
+            shard_id,
             %prev_hash,
             ?state_root,
             num_parts = part_id.total)
@@ -1205,7 +1244,7 @@ impl RuntimeAdapter for NightshadeRuntime {
         debug!(target: "chain", %shard_id, "Inserting {} values to flat storage", flat_state_delta.len());
         // TODO: `apply_to_flat_state` inserts values with random writes, which can be time consuming.
         //       Optimize taking into account that flat state values always correspond to a consecutive range of keys.
-        flat_state_delta.apply_to_flat_state(&mut store_update.flat_store_update(), shard_uid);
+        flat_state_delta.apply_to_flat_state(&mut store_update, shard_uid);
         self.precompile_contracts(epoch_id, contract_codes)?;
         Ok(store_update.commit()?)
     }
@@ -1296,53 +1335,6 @@ impl RuntimeAdapter for NightshadeRuntime {
         let epoch_manager = self.epoch_manager.read();
         Ok(epoch_manager.will_shard_layout_change(parent_hash)?)
     }
-
-    fn compiled_contract_cache(&self) -> &dyn ContractRuntimeCache {
-        self.compiled_contract_cache.as_ref()
-    }
-
-    fn precompile_contracts(
-        &self,
-        epoch_id: &EpochId,
-        contract_codes: Vec<ContractCode>,
-    ) -> Result<(), Error> {
-        let _span = tracing::debug_span!(
-            target: "runtime",
-            "precompile_contracts",
-            num_contracts = contract_codes.len())
-        .entered();
-        let protocol_version = self.epoch_manager.get_epoch_protocol_version(epoch_id)?;
-        let runtime_config = self.runtime_config_store.get_config(protocol_version);
-        let compiled_contract_cache: Option<Box<dyn ContractRuntimeCache>> =
-            Some(Box::new(self.compiled_contract_cache.handle()));
-        // Execute precompile_contract in parallel but prevent it from using more than half of all
-        // threads so that node will still function normally.
-        rayon::scope(|scope| {
-            let (slot_sender, slot_receiver) = std::sync::mpsc::channel();
-            // Use up-to half of the threads for the compilation.
-            let max_threads = std::cmp::max(rayon::current_num_threads() / 2, 1);
-            for _ in 0..max_threads {
-                slot_sender.send(()).expect("both sender and receiver are owned here");
-            }
-            for code in contract_codes {
-                slot_receiver.recv().expect("could not receive a slot to compile contract");
-                let contract_cache = compiled_contract_cache.as_deref();
-                let slot_sender = slot_sender.clone();
-                scope.spawn(move |_| {
-                    precompile_contract(
-                        &code,
-                        Arc::clone(&runtime_config.wasm_config),
-                        contract_cache,
-                    )
-                    .ok();
-                    // If this fails, it just means there won't be any more attempts to recv the
-                    // slots
-                    let _ = slot_sender.send(());
-                });
-            }
-        });
-        Ok(())
-    }
 }
 
 /// Get the limit on the number of new receipts imposed by the local congestion control.
@@ -1372,7 +1364,7 @@ fn chunk_tx_gas_limit(
     protocol_version: u32,
     runtime_config: &RuntimeConfig,
     prev_block: &PrepareTransactionsBlockContext,
-    shard_id: ShardId,
+    shard_id: u64,
     gas_limit: u64,
 ) -> u64 {
     if !ProtocolFeature::CongestionControl.enabled(protocol_version) {
@@ -1396,18 +1388,11 @@ fn chunk_tx_gas_limit(
 fn calculate_transactions_size_limit(
     protocol_version: ProtocolVersion,
     runtime_config: &RuntimeConfig,
-    mut last_chunk_transactions_size: usize,
+    last_chunk_transactions_size: usize,
     transactions_gas_limit: Gas,
 ) -> u64 {
     // Checking feature WitnessTransactionLimits
     if ProtocolFeature::StatelessValidation.enabled(protocol_version) {
-        if near_primitives::checked_feature!(
-            "protocol_feature_relaxed_chunk_validation",
-            RelaxedChunkValidation,
-            protocol_version
-        ) {
-            last_chunk_transactions_size = 0;
-        }
         // Sum of transactions in the previous and current chunks should not exceed the limit.
         // Witness keeps transactions from both previous and current chunk, so we have to limit the sum of both.
         runtime_config

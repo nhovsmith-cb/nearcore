@@ -119,7 +119,8 @@ impl Trie {
             Some(NibbleSlice::nibbles_to_bytes(&nibbles_end))
         };
 
-        Ok(flat_storage_chunk_view.iter_range(key_begin.as_deref(), key_end.as_deref()))
+        Ok(flat_storage_chunk_view
+            .iter_flat_state_entries(key_begin.as_deref(), key_end.as_deref()))
     }
 
     /// Determines the boundaries of a state part by accessing the Trie (i.e. State column).
@@ -128,11 +129,10 @@ impl Trie {
         &self,
         part_id: PartId,
     ) -> Result<(PartialState, Vec<u8>, Vec<u8>), StorageError> {
-        // If chunk view is missing us ShardId::max() as fake value for metrics.
-        let shard_id = self
-            .flat_storage_chunk_view
-            .as_ref()
-            .map_or_else(ShardId::max, |chunk_view| chunk_view.shard_uid().shard_id());
+        let shard_id: ShardId = self.flat_storage_chunk_view.as_ref().map_or(
+            ShardId::MAX, // Fake value for metrics.
+            |chunk_view| chunk_view.shard_uid().shard_id as ShardId,
+        );
         let _span = tracing::debug_span!(
             target: "state-parts",
             "get_state_part_boundaries",
@@ -183,11 +183,10 @@ impl Trie {
         nibbles_end: Vec<u8>,
         state_trie: &Trie,
     ) -> Result<PartialState, StorageError> {
-        // If chunk view is missing us ShardId::max() as fake value for metrics.
-        let shard_id = self
-            .flat_storage_chunk_view
-            .as_ref()
-            .map_or_else(ShardId::max, |chunk_view| chunk_view.shard_uid().shard_id());
+        let shard_id: ShardId = self.flat_storage_chunk_view.as_ref().map_or(
+            ShardId::MAX, // Fake value for metrics.
+            |chunk_view| chunk_view.shard_uid().shard_id as ShardId,
+        );
         let _span = tracing::debug_span!(
             target: "state-parts",
             "get_trie_nodes_for_part_with_flat_storage",
@@ -341,7 +340,7 @@ impl Trie {
         memory_skipped: &mut u64,
         key_nibbles: &mut Vec<u8>,
     ) -> Result<bool, StorageError> {
-        *memory_skipped += node.node.memory_usage_direct();
+        *memory_skipped += node.node.memory_usage_direct_no_memory();
 
         match &node.node {
             TrieNode::Empty => Ok(false),
@@ -360,8 +359,11 @@ impl Trie {
 
                 let mut iter = children.iter();
                 while let Some((index, child)) = iter.next() {
-                    let NodeHandle::Hash(h) = child;
-                    let child = self.retrieve_node(h)?.1;
+                    let child = if let NodeHandle::Hash(h) = child {
+                        self.retrieve_node(h)?.1
+                    } else {
+                        unreachable!("only possible while mutating")
+                    };
                     if *memory_skipped + child.memory_usage > memory_threshold {
                         core::mem::drop(iter);
                         key_nibbles.push(index);
@@ -379,6 +381,7 @@ impl Trie {
             }
             TrieNode::Extension(key, child_handle) => {
                 let child = match child_handle {
+                    NodeHandle::InMemory(_) => unreachable!("only possible while mutating"),
                     NodeHandle::Hash(h) => self.retrieve_node(h)?.1,
                 };
                 let (slice, _) = NibbleSlice::from_encoded(key);
@@ -515,7 +518,6 @@ mod tests {
 
     use near_primitives::hash::{hash, CryptoHash};
 
-    use crate::adapter::StoreUpdateAdapter;
     use crate::test_utils::{gen_changes, test_populate_trie, TestTriesBuilder};
     use crate::trie::iterator::CrumbStatus;
     use crate::trie::{
@@ -523,7 +525,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::MissingTrieValueContext;
+    use crate::{DBCol, MissingTrieValueContext, TrieCachingStorage};
     use near_primitives::shard_layout::ShardUId;
 
     /// Checks that sampling state boundaries always gives valid state keys
@@ -708,10 +710,13 @@ mod tests {
                     },
                     TrieNode::Extension(_key, child) => {
                         if let CrumbStatus::Entering = position {
-                            let NodeHandle::Hash(h) = child.clone();
-                            let child = self.retrieve_node(&h)?.1;
-                            stack.push((h, node, CrumbStatus::Exiting));
-                            stack.push((h, child, CrumbStatus::Entering));
+                            if let NodeHandle::Hash(h) = child.clone() {
+                                let child = self.retrieve_node(&h)?.1;
+                                stack.push((h, node, CrumbStatus::Exiting));
+                                stack.push((h, child, CrumbStatus::Entering));
+                            } else {
+                                unreachable!("only possible while mutating")
+                            }
                         }
                     }
                 }
@@ -1200,7 +1205,7 @@ mod tests {
             state_items.into_iter().map(|(k, v)| (k, Some(FlatStateValue::inlined(&v))));
         let delta = FlatStateChanges::from(changes_for_delta);
         let mut store_update = tries.store_update();
-        delta.apply_to_flat_state(&mut store_update.flat_store_update(), shard_uid);
+        delta.apply_to_flat_state(&mut store_update, shard_uid);
         store_update.commit().unwrap();
 
         let (partial_state, nibbles_begin, nibbles_end) =
@@ -1223,7 +1228,8 @@ mod tests {
         let mut store_update = tries.store_update();
         let store_value = vec![5; value_len];
         let value_hash = hash(&store_value);
-        store_update.decrement_refcount(shard_uid, &value_hash);
+        let store_key = TrieCachingStorage::get_key_from_shard_uid_and_hash(shard_uid, &value_hash);
+        store_update.decrement_refcount(DBCol::State, &store_key);
         store_update.commit().unwrap();
 
         assert_eq!(
@@ -1247,7 +1253,7 @@ mod tests {
         // is invalid.
         let mut store_update = tries.store_update();
         let delta = FlatStateChanges::from(vec![(b"ba".to_vec(), None)]);
-        delta.apply_to_flat_state(&mut store_update.flat_store_update(), shard_uid);
+        delta.apply_to_flat_state(&mut store_update, shard_uid);
         store_update.commit().unwrap();
 
         assert_matches!(

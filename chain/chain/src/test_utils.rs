@@ -19,7 +19,6 @@ use near_epoch_manager::shard_tracker::ShardTracker;
 use near_epoch_manager::{EpochManager, EpochManagerHandle};
 use near_primitives::block::Block;
 use near_primitives::hash::CryptoHash;
-use near_primitives::stateless_validation::ChunkProductionKey;
 use near_primitives::test_utils::create_test_signer;
 use near_primitives::types::{AccountId, NumBlocks, NumShards};
 use near_primitives::utils::MaybeValidated;
@@ -33,7 +32,6 @@ use tracing::debug;
 
 pub use self::kv_runtime::{account_id_to_shard_id, KeyValueRuntime, MockEpochManager};
 pub use self::validator_schedule::ValidatorSchedule;
-use near_async::messaging::{noop, IntoMultiSender};
 
 pub fn get_chain(clock: Clock) -> Chain {
     get_chain_with_epoch_length_and_num_shards(clock, 10, 1)
@@ -63,7 +61,7 @@ pub fn get_chain_with_epoch_length_and_num_shards(
     let tempdir = tempfile::tempdir().unwrap();
     initialize_genesis_state(store.clone(), &genesis, Some(tempdir.path()));
     let chain_genesis = ChainGenesis::new(&genesis.config);
-    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config, None);
+    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config);
     let shard_tracker = ShardTracker::new_empty(epoch_manager.clone());
     let runtime =
         NightshadeRuntime::test(tempdir.path(), store, &genesis.config, epoch_manager.clone());
@@ -78,7 +76,6 @@ pub fn get_chain_with_epoch_length_and_num_shards(
         None,
         Arc::new(RayonAsyncComputationSpawner),
         MutableConfigValue::new(None, "validator_signer"),
-        noop().into_multi_sender(),
     )
     .unwrap()
 }
@@ -148,7 +145,7 @@ pub fn setup_with_tx_validity_period(
     genesis.config.protocol_version = PROTOCOL_VERSION;
     let tempdir = tempfile::tempdir().unwrap();
     initialize_genesis_state(store.clone(), &genesis, Some(tempdir.path()));
-    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config, None);
+    let epoch_manager = EpochManager::new_arc_handle(store.clone(), &genesis.config);
     let shard_tracker = ShardTracker::new_empty(epoch_manager.clone());
     let runtime =
         NightshadeRuntime::test(tempdir.path(), store, &genesis.config, epoch_manager.clone());
@@ -163,7 +160,6 @@ pub fn setup_with_tx_validity_period(
         None,
         Arc::new(RayonAsyncComputationSpawner),
         MutableConfigValue::new(None, "validator_signer"),
-        noop().into_multi_sender(),
     )
     .unwrap();
 
@@ -230,15 +226,14 @@ pub fn display_chain(me: &Option<AccountId>, chain: &mut Chain, tail: bool) {
                 }
             );
             if let Some(block) = maybe_block {
-                for chunk_header in block.chunks().iter_deprecated() {
+                for chunk_header in block.chunks().iter() {
                     let chunk_producer = epoch_manager
-                        .get_chunk_producer_info(&ChunkProductionKey {
-                            epoch_id,
-                            height_created: chunk_header.height_created(),
-                            shard_id: chunk_header.shard_id(),
-                        })
-                        .unwrap()
-                        .take_account_id();
+                        .get_chunk_producer(
+                            &epoch_id,
+                            chunk_header.height_created(),
+                            chunk_header.shard_id(),
+                        )
+                        .unwrap();
                     if let Ok(chunk) = chain_store.get_chunk(&chunk_header.chunk_hash()) {
                         debug!(
                             "    {: >3} {} | {} | {: >10} | tx = {: >2}, receipts = {: >2}",
@@ -307,7 +302,7 @@ mod test {
     }
 
     fn test_build_receipt_hashes_with_num_shard(num_shards: NumShards) {
-        let shard_layout = ShardLayout::multi_shard(num_shards, 0);
+        let shard_layout = ShardLayout::v0(num_shards, 0);
         let create_receipt_from_receiver_id =
             |receiver_id| Receipt::new_balance_refund(&receiver_id, 0, ReceiptPriority::NoPriority);
         let mut rng = rand::thread_rng();

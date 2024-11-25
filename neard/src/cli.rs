@@ -20,7 +20,7 @@ use near_o11y::{
 use near_ping::PingCommand;
 use near_primitives::hash::CryptoHash;
 use near_primitives::merkle::compute_root_from_path;
-use near_primitives::types::{Gas, NumSeats, NumShards, ProtocolVersion, ShardId};
+use near_primitives::types::{Gas, NumSeats, NumShards};
 use near_replay_archive_tool::ReplayArchiveCommand;
 use near_state_parts::cli::StatePartsCommand;
 use near_state_parts_dump_check::cli::StatePartsDumpCheckCommand;
@@ -255,26 +255,6 @@ pub(super) enum NeardSubCommand {
     ReplayArchive(ReplayArchiveCommand),
 }
 
-#[derive(Debug, Clone)]
-enum FirstProtocolVersion {
-    Since(ProtocolVersion),
-    Latest,
-}
-
-impl FromStr for FirstProtocolVersion {
-    type Err = String;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        match input {
-            "latest" => Ok(FirstProtocolVersion::Latest),
-            _ => input
-                .parse::<ProtocolVersion>()
-                .map(FirstProtocolVersion::Since)
-                .map_err(|_| format!("Invalid value for FirstProtocolVersion: {}", input)),
-        }
-    }
-}
-
 #[derive(clap::Parser)]
 pub(super) struct InitCmd {
     /// Download the verified NEAR genesis file automatically.
@@ -320,10 +300,6 @@ pub(super) struct InitCmd {
     /// from genesis configuration will be taken.
     #[clap(long)]
     max_gas_burnt_view: Option<Gas>,
-    /// Dump epoch config from the given protocol version onwards.
-    /// Can be a number or the word "latest".
-    #[clap(long)]
-    dump_epoch_config: Option<FirstProtocolVersion>,
 }
 
 /// Warns if unsupported build of the executable is used on mainnet or testnet.
@@ -381,11 +357,6 @@ impl InitCmd {
             None
         };
 
-        let dump_epoch_config = self.dump_epoch_config.map(|first| match first {
-            FirstProtocolVersion::Since(version) => version,
-            FirstProtocolVersion::Latest => near_primitives::version::PROTOCOL_VERSION,
-        });
-
         nearcore::init_configs(
             home_dir,
             self.chain_id,
@@ -401,7 +372,6 @@ impl InitCmd {
             self.download_config_url.as_deref(),
             self.boot_nodes.as_deref(),
             self.max_gas_burnt_view,
-            dump_epoch_config,
         )
         .context("Failed to initialize configs")
     }
@@ -656,17 +626,16 @@ pub(super) struct LocalnetCmd {
 }
 
 impl LocalnetCmd {
-    fn parse_tracked_shards(tracked_shards: &str, num_shards: NumShards) -> Vec<ShardId> {
+    fn parse_tracked_shards(tracked_shards: &str, num_shards: NumShards) -> Vec<u64> {
         if tracked_shards.to_lowercase() == "all" {
-            let tracked_shards = 0..num_shards;
-            return tracked_shards.map(ShardId::new).collect();
+            return (0..num_shards).collect();
         }
         if tracked_shards.to_lowercase() == "none" {
             return vec![];
         }
         tracked_shards
             .split(',')
-            .map(|shard_id| shard_id.parse::<ShardId>().expect("Shard id must be an integer"))
+            .map(|shard_id| shard_id.parse::<u64>().expect("Shard id must be an integer"))
             .collect()
     }
 

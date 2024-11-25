@@ -160,7 +160,8 @@ fn run_multiple_nodes(
 }
 
 #[test]
-fn ultra_slow_test_highload() {
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn test_highload() {
     // Run 4 nodes with 20 input tps and check the output tps to be 20.
     heavy_test(|| run_multiple_nodes(4, 20, 20, Duration::from_secs(120), "4_20"));
 }

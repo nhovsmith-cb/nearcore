@@ -601,7 +601,7 @@ mod tests {
 
     use super::*;
     use crate::near_primitives::trie_key::TrieKey;
-    use near_store::set;
+    use near_store::{set, set_code};
     use near_vm_runner::ContractCode;
 
     /// Initial balance used in tests.
@@ -679,7 +679,8 @@ mod tests {
             if has_contract {
                 let code = vec![0; 100];
                 let code_hash = hash(&code);
-                initial_state.set_code(
+                set_code(
+                    &mut initial_state,
                     account_id.clone(),
                     &ContractCode::new(code.clone(), Some(code_hash)),
                 );
@@ -706,7 +707,7 @@ mod tests {
             set_account(&mut initial_state, account_id.clone(), &initial_account);
         }
         initial_state.commit(StateChangeCause::InitialState);
-        let trie_changes = initial_state.finalize().unwrap().trie_changes;
+        let trie_changes = initial_state.finalize().unwrap().1;
         let mut store_update = tries.store_update();
         let root = tries.apply_all(&trie_changes, ShardUId::single_shard(), &mut store_update);
         store_update.commit().unwrap();

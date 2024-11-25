@@ -2,7 +2,6 @@ use core::time;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use near_async::messaging::{noop, IntoMultiSender};
 use near_async::time::Clock;
 use near_chain::rayon_spawner::RayonAsyncComputationSpawner;
 use near_chain::resharding::v2::ReshardingResponse;
@@ -129,8 +128,7 @@ impl ReshardingV2Command {
     fn get_chain(&self, mut config: NearConfig, home_dir: &Path) -> Result<Chain, anyhow::Error> {
         let store = self.get_store(home_dir, &mut config)?;
 
-        let epoch_manager =
-            EpochManager::new_arc_handle(store.clone(), &config.genesis.config, Some(home_dir));
+        let epoch_manager = EpochManager::new_arc_handle(store.clone(), &config.genesis.config);
         let genesis_epoch_config = epoch_manager.get_epoch_config(&EpochId::default())?;
         initialize_sharded_genesis_state(
             store.clone(),
@@ -162,8 +160,6 @@ impl ReshardingV2Command {
             None,
             Arc::new(RayonAsyncComputationSpawner),
             MutableConfigValue::new(None, "validator_signer"),
-            // Resharding sender is not used in resharding-v2.
-            noop().into_multi_sender(),
         )
         .unwrap();
         Ok(chain)

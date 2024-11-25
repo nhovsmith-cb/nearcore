@@ -51,8 +51,7 @@ where
     Self::Context: DelayedActionRunner<T>,
     T: messaging::HandlerWithContext<M>,
     M: actix::Message,
-    <M as actix::Message>::Result:
-        actix::dev::MessageResponse<ActixWrapper<T>, WithSpanContext<M>> + Send,
+    <M as actix::Message>::Result: actix::dev::MessageResponse<ActixWrapper<T>, WithSpanContext<M>>,
 {
     type Result = M::Result;
     fn handle(&mut self, msg: WithSpanContext<M>, ctx: &mut Self::Context) -> Self::Result {
@@ -84,7 +83,7 @@ where
     T: messaging::Handler<M>,
     M: actix::Message,
     <M as actix::Message>::Result:
-        actix::dev::MessageResponse<SyncActixWrapper<T>, WithSpanContext<M>> + Send,
+        actix::dev::MessageResponse<SyncActixWrapper<T>, WithSpanContext<M>>,
 {
     type Result = M::Result;
     fn handle(&mut self, msg: WithSpanContext<M>, _ctx: &mut Self::Context) -> Self::Result {

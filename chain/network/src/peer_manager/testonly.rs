@@ -26,10 +26,9 @@ use crate::test_utils;
 use crate::testonly::actix::ActixSystem;
 use crate::types::{
     AccountKeys, ChainInfo, KnownPeerStatus, NetworkRequests, PeerManagerMessageRequest,
-    PeerManagerSenderForNetworkInput, PeerManagerSenderForNetworkMessage, ReasonForBan,
+    ReasonForBan,
 };
 use crate::PeerManagerActor;
-use futures::FutureExt;
 use near_async::messaging::IntoMultiSender;
 use near_async::messaging::Sender;
 use near_async::time;
@@ -74,7 +73,6 @@ pub enum Event {
     ShardsManager(ShardsManagerRequestFromNetwork),
     Client(ClientSenderForNetworkInput),
     PeerManager(PME),
-    PeerManagerSender(PeerManagerSenderForNetworkInput),
     PartialWitness(PartialWitnessSenderForNetworkInput),
 }
 
@@ -600,25 +598,21 @@ pub(crate) async fn start(
                                     header: None,
                                     part,
                                 });
-                            let result =
-                                Some(StateResponse(Box::new(StateResponseInfo::V2(Box::new(
-                                    StateResponseInfoV2 { shard_id, sync_hash, state_response },
-                                )))));
-                            (msg.callback)(std::future::ready(Ok(result)).boxed());
+                            let result = Some(StateResponse(Box::new(StateResponseInfo::V2(
+                                StateResponseInfoV2 { shard_id, sync_hash, state_response },
+                            ))));
+                            (msg.callback)(Ok(result));
                             send.send(Event::Client(
                                 ClientSenderForNetworkInput::_state_request_part(msg.message),
                             ));
                         }
                         ClientSenderForNetworkMessage::_announce_account(msg) => {
-                            (msg.callback)(
-                                std::future::ready(Ok(Ok(msg
-                                    .message
-                                    .0
-                                    .iter()
-                                    .map(|(account, _)| account.clone())
-                                    .collect())))
-                                .boxed(),
-                            );
+                            (msg.callback)(Ok(Ok(msg
+                                .message
+                                .0
+                                .iter()
+                                .map(|(account, _)| account.clone())
+                                .collect())));
                             send.send(Event::Client(
                                 ClientSenderForNetworkInput::_announce_account(msg.message),
                             ));
@@ -627,12 +621,6 @@ pub(crate) async fn start(
                             send.send(Event::Client(event.into_input()));
                         }
                     }
-                }
-            });
-            let peer_manager_sender = Sender::from_fn({
-                let send = send.clone();
-                move |event: PeerManagerSenderForNetworkMessage| {
-                    send.send(Event::PeerManagerSender(event.into_input()));
                 }
             });
             let shards_manager_sender = Sender::from_fn({
@@ -652,7 +640,6 @@ pub(crate) async fn start(
                 store,
                 cfg,
                 client_sender.break_apart().into_multi_sender(),
-                peer_manager_sender.break_apart().into_multi_sender(),
                 shards_manager_sender,
                 state_witness_sender.break_apart().into_multi_sender(),
                 genesis_id,

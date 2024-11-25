@@ -12,9 +12,7 @@ use near_async::time::{Clock, Duration, Instant};
 use near_chain::types::{RuntimeAdapter, Tip};
 use near_chain::{
     get_epoch_block_producers_view, Chain, ChainGenesis, ChainStoreAccess, DoomslugThresholdMode,
-    MerkleProofAccess,
 };
-
 use near_chain_configs::{ClientConfig, MutableValidatorSigner, ProtocolConfigView};
 use near_chain_primitives::error::EpochErrorResultToChainError;
 use near_client_primitives::types::{
@@ -48,7 +46,6 @@ use near_primitives::sharding::ShardChunk;
 use near_primitives::state_sync::{
     ShardStateSyncResponse, ShardStateSyncResponseHeader, ShardStateSyncResponseV3,
 };
-use near_primitives::stateless_validation::ChunkProductionKey;
 use near_primitives::transaction::SignedTransaction;
 use near_primitives::types::{
     AccountId, BlockHeight, BlockId, BlockReference, EpochReference, Finality, MaybeBlockId,
@@ -302,7 +299,6 @@ impl ViewClientActorInner {
         let head = self.chain.head()?;
         let epoch_id = self.epoch_manager.get_epoch_id(&head.last_block_hash)?;
         let epoch_info: Arc<EpochInfo> = self.epoch_manager.get_epoch_info(&epoch_id)?;
-        let shard_layout = self.epoch_manager.get_shard_layout(&epoch_id)?;
         let shard_ids = self.epoch_manager.shard_ids(&epoch_id)?;
         let cur_block_info = self.epoch_manager.get_block_info(&head.last_block_hash)?;
         let next_epoch_start_height =
@@ -313,17 +309,13 @@ impl ViewClientActorInner {
         let mut start_block_of_window: Option<BlockHeight> = None;
         let last_block_of_epoch = next_epoch_start_height - 1;
 
-        // This loop does not go beyond the current epoch so it is valid to use
-        // the EpochInfo and ShardLayout from the current epoch.
         for block_height in head.height..next_epoch_start_height {
             let bp = epoch_info.sample_block_producer(block_height);
             let bp = epoch_info.get_validator(bp).account_id().clone();
             let cps: Vec<AccountId> = shard_ids
                 .iter()
                 .map(|&shard_id| {
-                    let cp = epoch_info
-                        .sample_chunk_producer(&shard_layout, shard_id, block_height)
-                        .unwrap();
+                    let cp = epoch_info.sample_chunk_producer(block_height, shard_id).unwrap();
                     let cp = epoch_info.get_validator(cp).account_id().clone();
                     cp
                 })
@@ -627,12 +619,11 @@ impl ViewClientActorInner {
                     .map_err(|err| TxStatusError::InternalError(err.to_string()))?;
                 let validator = self
                     .epoch_manager
-                    .get_chunk_producer_info(&ChunkProductionKey {
-                        epoch_id: head.epoch_id,
-                        height_created: head.height + self.config.tx_routing_height_horizon - 1,
-                        shard_id: target_shard_id,
-                    })
-                    .map(|info| info.take_account_id())
+                    .get_chunk_producer(
+                        &head.epoch_id,
+                        head.height + self.config.tx_routing_height_horizon - 1,
+                        target_shard_id,
+                    )
                     .map_err(|err| TxStatusError::ChainError(err.into()))?;
 
                 self.network_adapter.send(PeerManagerMessageRequest::NetworkRequests(
@@ -760,12 +751,9 @@ fn get_chunk_from_block(
     shard_id: ShardId,
     chain: &Chain,
 ) -> Result<ShardChunk, near_chain::Error> {
-    let epoch_id = block.header().epoch_id();
-    let shard_layout = chain.epoch_manager.get_shard_layout(epoch_id)?;
-    let shard_index = shard_layout.get_shard_index(shard_id)?;
     let chunk_header = block
         .chunks()
-        .get(shard_index)
+        .get(shard_id as usize)
         .ok_or_else(|| near_chain::Error::InvalidShardId(shard_id))?
         .clone();
     let chunk_hash = chunk_header.chunk_hash();
@@ -832,12 +820,7 @@ impl Handler<GetChunk> for ViewClientActorInner {
             .into_chain_error()?;
         let author = self
             .epoch_manager
-            .get_chunk_producer_info(&ChunkProductionKey {
-                epoch_id,
-                height_created: chunk_inner.height_created(),
-                shard_id: chunk_inner.shard_id(),
-            })
-            .map(|info| info.take_account_id())
+            .get_chunk_producer(&epoch_id, chunk_inner.height_created(), chunk_inner.shard_id())
             .into_chain_error()?;
 
         Ok(ChunkView::from_author_chunk(author, chunk))
@@ -1093,15 +1076,9 @@ impl Handler<GetExecutionOutcome> for ViewClientActorInner {
                 let mut outcome_proof = outcome;
                 let epoch_id =
                     *self.chain.get_block(&outcome_proof.block_hash)?.header().epoch_id();
-                let shard_layout =
-                    self.epoch_manager.get_shard_layout(&epoch_id).into_chain_error()?;
                 let target_shard_id = self
                     .epoch_manager
                     .account_id_to_shard_id(&account_id, &epoch_id)
-                    .into_chain_error()?;
-                let target_shard_index = shard_layout
-                    .get_shard_index(target_shard_id)
-                    .map_err(Into::into)
                     .into_chain_error()?;
                 let res = self.chain.get_next_block_hash_with_new_chunk(
                     &outcome_proof.block_hash,
@@ -1115,10 +1092,10 @@ impl Handler<GetExecutionOutcome> for ViewClientActorInner {
                         .chain
                         .get_block(&h)?
                         .chunks()
-                        .iter_deprecated()
+                        .iter()
                         .map(|header| header.prev_outcome_root())
                         .collect::<Vec<_>>();
-                    if target_shard_index >= outcome_roots.len() {
+                    if target_shard_id >= (outcome_roots.len() as u64) {
                         return Err(GetExecutionOutcomeError::InconsistentState {
                             number_or_shards: outcome_roots.len(),
                             execution_outcome_shard_id: target_shard_id,
@@ -1126,7 +1103,8 @@ impl Handler<GetExecutionOutcome> for ViewClientActorInner {
                     }
                     Ok(GetExecutionOutcomeResponse {
                         outcome_proof: outcome_proof.into(),
-                        outcome_root_proof: merklize(&outcome_roots).1[target_shard_index].clone(),
+                        outcome_root_proof: merklize(&outcome_roots).1[target_shard_id as usize]
+                            .clone(),
                     })
                 } else {
                     Err(GetExecutionOutcomeError::NotConfirmed { transaction_or_receipt_id: id })
@@ -1206,10 +1184,7 @@ impl Handler<GetBlockProof> for ViewClientActorInner {
         let head_block_header = self.chain.get_block_header(&msg.head_block_hash)?;
         self.chain.check_blocks_final_and_canonical(&[block_header.clone(), head_block_header])?;
         let block_header_lite = block_header.into();
-        let proof = self.chain.compute_past_block_proof_in_merkle_tree_of_later_block(
-            &msg.block_hash,
-            &msg.head_block_hash,
-        )?;
+        let proof = self.chain.get_block_proof(&msg.block_hash, &msg.head_block_hash)?;
         Ok(GetBlockProofResponse { block_header_lite, proof })
     }
 }
@@ -1354,7 +1329,7 @@ impl Handler<StateRequestHeader> for ViewClientActorInner {
             .start_timer();
         let StateRequestHeader { shard_id, sync_hash } = msg;
         if self.throttle_state_sync_request() {
-            metrics::STATE_SYNC_REQUESTS_THROTTLED_TOTAL.inc();
+            tracing::debug!(target: "sync", ?sync_hash, "Throttle state sync requests");
             return None;
         }
         let header = match self.chain.check_sync_hash_validity(&sync_hash) {
@@ -1386,7 +1361,7 @@ impl Handler<StateRequestHeader> for ViewClientActorInner {
                 let header = match header {
                     ShardStateSyncResponseHeader::V2(inner) => inner,
                     _ => {
-                        tracing::error!(target: "sync", ?sync_hash, ?shard_id, "Invalid state sync header format");
+                        tracing::error!(target: "sync", ?sync_hash, shard_id, "Invalid state sync header format");
                         return None;
                     }
                 };
@@ -1406,11 +1381,8 @@ impl Handler<StateRequestHeader> for ViewClientActorInner {
                 can_generate: false,
             }),
         };
-        let info = StateResponseInfo::V2(Box::new(StateResponseInfoV2 {
-            shard_id,
-            sync_hash,
-            state_response,
-        }));
+        let info =
+            StateResponseInfo::V2(StateResponseInfoV2 { shard_id, sync_hash, state_response });
         Some(StateResponse(Box::new(info)))
     }
 }
@@ -1424,7 +1396,7 @@ impl Handler<StateRequestPart> for ViewClientActorInner {
             .start_timer();
         let StateRequestPart { shard_id, sync_hash, part_id } = msg;
         if self.throttle_state_sync_request() {
-            metrics::STATE_SYNC_REQUESTS_THROTTLED_TOTAL.inc();
+            tracing::debug!(target: "sync", ?sync_hash, "Throttle state sync requests");
             return None;
         }
         if let Err(err) = self.has_state_snapshot(&sync_hash, shard_id) {
@@ -1437,16 +1409,16 @@ impl Handler<StateRequestPart> for ViewClientActorInner {
                 let part = match self.chain.get_state_response_part(shard_id, part_id, sync_hash) {
                     Ok(part) => Some((part_id, part)),
                     Err(err) => {
-                        error!(target: "sync", ?err, ?sync_hash, ?shard_id, part_id, "Cannot build state part");
+                        error!(target: "sync", ?err, ?sync_hash, shard_id, part_id, "Cannot build state part");
                         None
                     }
                 };
 
-                tracing::trace!(target: "sync", ?sync_hash, ?shard_id, part_id, "Finished computation for state request part");
+                tracing::trace!(target: "sync", ?sync_hash, shard_id, part_id, "Finished computation for state request part");
                 part
             }
             Ok(false) => {
-                warn!(target: "sync", ?sync_hash, ?shard_id, "sync_hash didn't pass validation, possible malicious behavior");
+                warn!(target: "sync", ?sync_hash, shard_id, "sync_hash didn't pass validation, possible malicious behavior");
                 // Do not respond, possible malicious behavior.
                 return None;
             }
@@ -1468,11 +1440,8 @@ impl Handler<StateRequestPart> for ViewClientActorInner {
             cached_parts: None,
             can_generate,
         });
-        let info = StateResponseInfo::V2(Box::new(StateResponseInfoV2 {
-            shard_id,
-            sync_hash,
-            state_response,
-        }));
+        let info =
+            StateResponseInfo::V2(StateResponseInfoV2 { shard_id, sync_hash, state_response });
         Some(StateResponse(Box::new(info)))
     }
 }

@@ -1,8 +1,7 @@
 use crate::EpochInfo;
 use crate::RngSeed;
 use near_primitives::types::validator_stake::ValidatorStake;
-use near_primitives::types::ShardIndex;
-use near_primitives::types::{Balance, NumShards};
+use near_primitives::types::{Balance, NumShards, ShardId};
 use near_primitives::utils::min_heap::{MinHeap, PeekMut};
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -23,48 +22,21 @@ impl HasStake for ValidatorStake {
     }
 }
 
-/// A helper struct to maintain the shard assignment sorted by the number of
-/// validators assigned to each shard.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ValidatorsFirstShardAssignmentItem {
-    validators: usize,
-    stake: Balance,
-    shard_index: ShardIndex,
-}
-
-type ValidatorsFirstShardAssignment = MinHeap<ValidatorsFirstShardAssignmentItem>;
-
-/// A helper struct to maintain the shard assignment sorted by the stake
-/// assigned to each shard.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct StakeFirstShardAssignmentItem {
-    stake: Balance,
-    validators: usize,
-    shard_index: ShardIndex,
-}
-
-type StakeFirstShardAssignment = MinHeap<StakeFirstShardAssignmentItem>;
-
-impl From<ValidatorsFirstShardAssignmentItem> for StakeFirstShardAssignmentItem {
-    fn from(v: ValidatorsFirstShardAssignmentItem) -> Self {
-        Self { validators: v.validators, stake: v.stake, shard_index: v.shard_index }
-    }
-}
-
 fn assign_to_satisfy_shards_inner<T: HasStake + Eq, I: Iterator<Item = (usize, T)>>(
-    shard_assignment: &mut ValidatorsFirstShardAssignment,
+    shard_index: &mut MinHeap<(usize, Balance, ShardId)>,
     result: &mut Vec<Vec<T>>,
     cp_iter: &mut I,
     min_validators_per_shard: usize,
 ) {
-    let mut buffer = Vec::with_capacity(shard_assignment.len());
-    // Stores (shard_index, cp_index) meaning that cp at cp_index has already been
-    // added to shard shard_index.  Used to make sure we don’t add a cp to the same
+    let mut buffer = Vec::with_capacity(shard_index.len());
+    // Stores (shard_id, cp_index) meaning that cp at cp_index has already been
+    // added to shard shard_id.  Used to make sure we don’t add a cp to the same
     // shard multiple times.
-    let seen_capacity = result.len() * min_validators_per_shard;
-    let mut seen = HashSet::<(ShardIndex, usize)>::with_capacity(seen_capacity);
+    let mut seen = std::collections::HashSet::<(ShardId, usize)>::with_capacity(
+        result.len() * min_validators_per_shard,
+    );
 
-    while shard_assignment.peek().unwrap().validators < min_validators_per_shard {
+    while shard_index.peek().unwrap().0 < min_validators_per_shard {
         // cp_iter is an infinite cycle iterator so getting next value can never
         // fail.  cp_index is index of each element in the iterator but the
         // indexing is done before cycling thus the same cp always gets the same
@@ -73,26 +45,26 @@ fn assign_to_satisfy_shards_inner<T: HasStake + Eq, I: Iterator<Item = (usize, T
         // Decide which shard to assign this chunk producer to.  We mustn’t
         // assign producers to a single shard multiple times.
         loop {
-            match shard_assignment.peek_mut() {
+            match shard_index.peek_mut() {
                 None => {
                     // No shards left which don’t already contain this chunk
                     // producer.  Skip it and move to another producer.
                     break;
                 }
-                Some(top) if top.validators >= min_validators_per_shard => {
-                    // `shard_assignment` is sorted by number of chunk producers,
+                Some(top) if top.0 >= min_validators_per_shard => {
+                    // `shard_index` is sorted by number of chunk producers,
                     // thus all remaining shards have min_validators_per_shard
                     // producers already assigned to them.  Don’t assign current
                     // one to any shard and move to next cp.
                     break;
                 }
-                Some(mut top) if seen.insert((top.shard_index, cp_index)) => {
+                Some(mut top) if seen.insert((top.2, cp_index)) => {
                     // Chunk producer is not yet assigned to the shard and the
                     // shard still needs more producers.  Assign `cp` to it and
                     // move to next one.
-                    top.validators += 1;
-                    top.stake += cp.get_stake();
-                    result[top.shard_index].push(cp);
+                    top.0 += 1;
+                    top.1 += cp.get_stake();
+                    result[usize::try_from(top.2).unwrap()].push(cp);
                     break;
                 }
                 Some(top) => {
@@ -106,7 +78,7 @@ fn assign_to_satisfy_shards_inner<T: HasStake + Eq, I: Iterator<Item = (usize, T
         }
         // Any shards we skipped over (because `cp` was already assigned to
         // them) need to be put back into the heap.
-        shard_assignment.extend(buffer.drain(..));
+        shard_index.extend(buffer.drain(..));
     }
 }
 
@@ -121,21 +93,15 @@ fn assign_to_satisfy_shards<T: HasStake + Eq + Clone>(
     let mut result: Vec<Vec<T>> = (0..num_shards).map(|_| Vec::new()).collect();
 
     // Initially, sort by number of validators first so we fill shards up.
-    let mut shard_assignment: ValidatorsFirstShardAssignment = (0..num_shards)
-        .map(|shard_index| shard_index as usize)
-        .map(|shard_index| ValidatorsFirstShardAssignmentItem {
-            validators: 0,
-            stake: 0,
-            shard_index,
-        })
-        .collect();
+    let mut shard_index: MinHeap<(usize, Balance, ShardId)> =
+        (0..num_shards).map(|s| (0, 0, s)).collect();
 
     // Distribute chunk producers until all shards have at least the
     // minimum requested number.  If there are not enough validators to satisfy
     // that requirement, assign some of the validators to multiple shards.
     let mut chunk_producers = chunk_producers.into_iter().enumerate().cycle();
     assign_to_satisfy_shards_inner(
-        &mut shard_assignment,
+        &mut shard_index,
         &mut result,
         &mut chunk_producers,
         min_validators_per_shard,
@@ -187,11 +153,7 @@ struct ShardSetItem {
 ///
 /// Caller must guarantee that `min_validators_per_shard` is achievable and
 /// `prev_chunk_producers_assignment` corresponds to the same number of shards.
-///
 /// TODO(resharding) - implement shard assignment
-/// The current shard assignment works fully based on the ShardIndex. During
-/// resharding those indices will change and the assignment will move many
-/// validators to different shards. This should be avoided.
 fn assign_to_balance_shards(
     chunk_producers: Vec<ValidatorStake>,
     num_shards: NumShards,
@@ -342,12 +304,8 @@ pub(crate) fn assign_chunk_producers_to_shards(
 
 pub(crate) mod old_validator_selection {
     use crate::shard_assignment::{assign_to_satisfy_shards_inner, HasStake, NotEnoughValidators};
-    use near_primitives::types::NumShards;
-
-    use super::{
-        StakeFirstShardAssignment, StakeFirstShardAssignmentItem, ValidatorsFirstShardAssignment,
-        ValidatorsFirstShardAssignmentItem,
-    };
+    use near_primitives::types::{Balance, NumShards, ShardId};
+    use near_primitives::utils::min_heap::MinHeap;
 
     /// Assign chunk producers (a.k.a. validators) to shards.  The i-th element
     /// of the output corresponds to the validators assigned to the i-th shard.
@@ -386,21 +344,15 @@ pub(crate) mod old_validator_selection {
         let mut result: Vec<Vec<T>> = (0..num_shards).map(|_| Vec::new()).collect();
 
         // Initially, sort by number of validators first so we fill shards up.
-        let mut shard_assignment: ValidatorsFirstShardAssignment = (0..num_shards)
-            .map(|shard_index| shard_index as usize)
-            .map(|shard_index| ValidatorsFirstShardAssignmentItem {
-                validators: 0,
-                stake: 0,
-                shard_index,
-            })
-            .collect();
+        let mut shard_index: MinHeap<(usize, Balance, ShardId)> =
+            (0..num_shards).map(|s| (0, 0, s)).collect();
 
         // First, distribute chunk producers until all shards have at least the
         // minimum requested number.  If there are not enough validators to satisfy
         // that requirement, assign some of the validators to multiple shards.
         let mut chunk_producers = chunk_producers.into_iter().enumerate().cycle();
         assign_to_satisfy_shards_inner(
-            &mut shard_assignment,
+            &mut shard_index,
             &mut result,
             &mut chunk_producers,
             min_validators_per_shard,
@@ -412,21 +364,20 @@ pub(crate) mod old_validator_selection {
             num_chunk_producers.saturating_sub(num_shards as usize * min_validators_per_shard);
         if remaining_producers > 0 {
             // Re-index shards to favour lowest stake first.
-            let mut shard_assignment: StakeFirstShardAssignment =
-                shard_assignment.into_iter().map(Into::into).collect();
+            let mut shard_index: MinHeap<(Balance, usize, ShardId)> = shard_index
+                .into_iter()
+                .map(|(count, stake, shard_id)| (stake, count, shard_id))
+                .collect();
 
             for (_, cp) in chunk_producers.take(remaining_producers) {
-                let StakeFirstShardAssignmentItem {
-                    stake: least_stake,
-                    validators: least_validator_count,
-                    shard_index,
-                } = shard_assignment.pop().expect("shard_assignment should never be empty");
-                shard_assignment.push(StakeFirstShardAssignmentItem {
-                    stake: least_stake + cp.get_stake(),
-                    validators: least_validator_count + 1,
-                    shard_index,
-                });
-                result[shard_index].push(cp);
+                let (least_stake, least_validator_count, shard_id) =
+                    shard_index.pop().expect("shard_index should never be empty");
+                shard_index.push((
+                    least_stake + cp.get_stake(),
+                    least_validator_count + 1,
+                    shard_id,
+                ));
+                result[usize::try_from(shard_id).unwrap()].push(cp);
             }
         }
 
@@ -439,7 +390,7 @@ mod tests {
     use crate::shard_assignment::{assign_chunk_producers_to_shards, NotEnoughValidators};
     use crate::RngSeed;
     use near_primitives::types::validator_stake::ValidatorStake;
-    use near_primitives::types::{AccountId, Balance, NumShards, ShardIndex};
+    use near_primitives::types::{AccountId, Balance, NumShards};
     use std::collections::{HashMap, HashSet};
 
     const EXPONENTIAL_STAKES: [Balance; 12] = [100, 90, 81, 73, 66, 59, 53, 48, 43, 39, 35, 31];
@@ -535,12 +486,12 @@ mod tests {
         let mut assignments = assignments
             .into_iter()
             .enumerate()
-            .map(|(shard_index, cps)| {
+            .map(|(shard_id, cps)| {
                 // All shards must have at least min_validators_per_shard validators.
                 assert!(
                     cps.len() >= min_validators_per_shard,
                     "Shard {} has only {} chunk producers; expected at least {}",
-                    shard_index,
+                    shard_id,
                     cps.len(),
                     min_validators_per_shard
                 );
@@ -549,7 +500,7 @@ mod tests {
                     cps.len(),
                     cps.iter().map(|cp| cp.0).collect::<HashSet<_>>().len(),
                     "Shard {} contains duplicate chunk producers: {:?}",
-                    shard_index,
+                    shard_id,
                     cps
                 );
                 // If all is good, aggregate as (cps_count, total_stake) pair.
@@ -569,12 +520,12 @@ mod tests {
             / (stakes.len() as Balance);
         let assignment = assign_shards(stakes, num_shards, min_validators_per_shard)
             .expect("There should have been enough validators");
-        for (shard_index, &cps) in assignment.iter().enumerate() {
+        for (shard_id, &cps) in assignment.iter().enumerate() {
             // Validator distribution should be even.
             assert_eq!(
                 validators_per_shard, cps.0,
                 "Shard {} has {} validators, expected {}",
-                shard_index, cps.0, validators_per_shard
+                shard_id, cps.0, validators_per_shard
             );
 
             // Stake distribution should be even
@@ -582,7 +533,7 @@ mod tests {
             assert!(
                 diff.abs() < diff_tolerance,
                 "Shard {}'s stake {} is {} away from average; expected less than {} away",
-                shard_index,
+                shard_id,
                 cps.1,
                 diff.abs(),
                 diff_tolerance
@@ -773,12 +724,12 @@ mod tests {
         assert_eq!(assignment, target_assignment);
     }
 
-    fn validator_to_shard(assignment: &[Vec<ValidatorStake>]) -> HashMap<AccountId, ShardIndex> {
+    fn validator_to_shard(assignment: &[Vec<ValidatorStake>]) -> HashMap<AccountId, usize> {
         assignment
             .iter()
             .enumerate()
-            .flat_map(|(shard_index, cps)| {
-                cps.iter().map(move |cp| (cp.account_id().clone(), shard_index))
+            .flat_map(|(shard_id, cps)| {
+                cps.iter().map(move |cp| (cp.account_id().clone(), shard_id))
             })
             .collect()
     }

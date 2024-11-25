@@ -1,7 +1,9 @@
-use crate::adapter::trie_store::TrieStoreAdapter;
 use crate::config::PrefetchConfig;
 use crate::sync_utils::Monitor;
-use crate::{metrics, StorageError, Trie, TrieCache, TrieConfig, TrieStorage};
+use crate::{
+    metrics, DBCol, MissingTrieValueContext, StorageError, Store, Trie, TrieCache,
+    TrieCachingStorage, TrieConfig, TrieStorage,
+};
 use crossbeam::select;
 use near_o11y::metrics::prometheus;
 use near_o11y::metrics::prometheus::core::GenericGauge;
@@ -45,7 +47,7 @@ const NUM_IO_THREADS: usize = 8;
 #[derive(Clone)]
 struct TriePrefetchingStorage {
     /// Store is shared with parent `TrieCachingStorage`.
-    store: TrieStoreAdapter,
+    store: Store,
     shard_uid: ShardUId,
     /// Shard cache is shared with parent `TrieCachingStorage`. But the
     /// pre-fetcher uses this in read-only mode to avoid premature evictions.
@@ -75,7 +77,7 @@ pub struct PrefetchApi {
     /// multiple times.
     pub(crate) prefetching: PrefetchStagingArea,
 
-    store: TrieStoreAdapter,
+    store: Store,
     shard_cache: TrieCache,
 
     pub enable_receipt_prefetching: bool,
@@ -241,17 +243,29 @@ impl TrieStorage for TriePrefetchingStorage {
         match prefetch_state {
             // Slot reserved for us, this thread should fetch it from DB.
             PrefetcherResult::SlotReserved => {
-                match self.store.get(self.shard_uid, hash) {
-                    Ok(value) => {
+                let key = TrieCachingStorage::get_key_from_shard_uid_and_hash(self.shard_uid, hash);
+                match self.store.get(DBCol::State, key.as_ref()) {
+                    Ok(Some(value)) => {
+                        let value: Arc<[u8]> = value.into();
                         self.prefetching.insert_fetched(*hash, value.clone());
                         Ok(value)
                     }
-                    Err(e) => {
-                        // This is an unrecoverable error.
+                    Ok(None) => {
+                        // This is an unrecoverable error, a hash found in the trie had no node.
                         // Releasing the lock here to unstuck main thread if it
                         // was blocking on this value, but it will also fail on its read.
                         self.prefetching.release(hash);
-                        Err(e)
+                        Err(StorageError::MissingTrieValue(
+                            MissingTrieValueContext::TriePrefetchingStorage,
+                            *hash,
+                        ))
+                    }
+                    Err(e) => {
+                        // This is an unrecoverable IO error.
+                        // Releasing the lock here to unstuck main thread if it
+                        // was blocking on this value, but it will also fail on its read.
+                        self.prefetching.release(hash);
+                        Err(StorageError::StorageInconsistentState(e.to_string()))
                     }
                 }
             }
@@ -289,7 +303,7 @@ impl TrieStorage for TriePrefetchingStorage {
 
 impl TriePrefetchingStorage {
     pub(crate) fn new(
-        store: TrieStoreAdapter,
+        store: Store,
         shard_uid: ShardUId,
         shard_cache: TrieCache,
         prefetching: PrefetchStagingArea,
@@ -388,7 +402,7 @@ impl PrefetchStagingArea {
 
 impl PrefetchApi {
     pub(crate) fn new(
-        store: TrieStoreAdapter,
+        store: Store,
         shard_cache: TrieCache,
         shard_uid: ShardUId,
         trie_config: &TrieConfig,
@@ -593,13 +607,12 @@ mod tests_utils {
 mod tests {
     use super::{PrefetchStagingArea, PrefetcherResult};
     use near_primitives::hash::CryptoHash;
-    use near_primitives::types::ShardId;
 
     #[test]
     fn test_prefetch_staging_area_blocking_get_after_update() {
         let key = CryptoHash::hash_bytes(&[1, 2, 3]);
         let value: std::sync::Arc<[u8]> = vec![4, 5, 6].into();
-        let prefetch_staging_area = PrefetchStagingArea::new(ShardId::new(0));
+        let prefetch_staging_area = PrefetchStagingArea::new(0);
         assert!(matches!(
             prefetch_staging_area.get_or_set_fetching(key),
             PrefetcherResult::SlotReserved

@@ -32,11 +32,7 @@ def get_state_sync_configs_pair(tracked_shards=[0]):
         "tracked_shards": [0],  # Track all shards
     }
     config_sync = {
-        "consensus.state_sync_external_timeout": {
-            "secs": 0,
-            "nanos": 500000000
-        },
-        "consensus.state_sync_p2p_timeout": {
+        "consensus.state_sync_timeout": {
             "secs": 0,
             "nanos": 500000000
         },
@@ -62,11 +58,7 @@ def get_state_sync_configs_pair(tracked_shards=[0]):
 def get_state_sync_config_combined():
     state_parts_dir = str(pathlib.Path(tempfile.gettempdir()) / "state_parts")
     config = {
-        "consensus.state_sync_external_timeout": {
-            "secs": 0,
-            "nanos": 500000000
-        },
-        "consensus.state_sync_p2p_timeout": {
+        "consensus.state_sync_timeout": {
             "secs": 0,
             "nanos": 500000000
         },

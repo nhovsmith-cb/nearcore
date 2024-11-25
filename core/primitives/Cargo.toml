@@ -20,7 +20,7 @@ bytesize.workspace = true
 bytes.workspace = true
 cfg-if.workspace = true
 chrono.workspace = true
-derive_more = { workspace = true, features = ["as_ref", "from", "into", "deref" ] }
+derive_more.workspace = true
 easy-ext.workspace = true
 hex.workspace = true
 itertools = { workspace = true, optional = true }
@@ -67,9 +67,6 @@ protocol_feature_reject_blocks_with_outdated_protocol_version = [
 protocol_feature_nonrefundable_transfer_nep491 = [
   "near-primitives-core/protocol_feature_nonrefundable_transfer_nep491",
 ]
-protocol_feature_relaxed_chunk_validation = [
-  "near-primitives-core/protocol_feature_relaxed_chunk_validation",
-]
 
 nightly = [
   "near-fmt/nightly",
@@ -81,7 +78,6 @@ nightly = [
   "protocol_feature_fix_staking_threshold",
   "protocol_feature_nonrefundable_transfer_nep491",
   "protocol_feature_reject_blocks_with_outdated_protocol_version",
-  "protocol_feature_relaxed_chunk_validation",
 ]
 
 nightly_protocol = [
@@ -106,7 +102,6 @@ bolero.workspace = true
 insta.workspace = true
 expect-test.workspace = true
 regex.workspace = true
-tempfile.workspace = true
 
 
 [[bench]]

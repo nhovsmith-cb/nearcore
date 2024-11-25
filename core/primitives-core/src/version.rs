@@ -172,26 +172,6 @@ pub enum ProtocolFeature {
     ChunkEndorsementsInBlockHeader,
     /// Store receipts in State in the StateStoredReceipt format.
     StateStoredReceipt,
-    /// Resharding V3
-    SimpleNightshadeV4,
-    /// Exclude contract code from the chunk state witness and distribute it to chunk validators separately.
-    ExcludeContractCodeFromStateWitness,
-    /// A scheduler which limits bandwidth for sending receipts between shards.
-    BandwidthScheduler,
-    /// Indicates that the "sync_hash" used to identify the point in the chain to sync state to
-    /// should no longer be the first block of the epoch, but a couple blocks after that in order
-    /// to sync the current epoch's state. This is not strictly a protocol feature, but is included
-    /// here to coordinate among nodes
-    CurrentEpochStateSync,
-    /// Relaxed validation of transactions included in a chunk.
-    ///
-    /// Chunks no longer become entirely invalid in case invalid transactions are included in the
-    /// chunk. Instead the transactions are discarded during their conversion to receipts.
-    #[cfg(feature = "protocol_feature_relaxed_chunk_validation")]
-    RelaxedChunkValidation,
-    /// Exclude existing contract code in deploy-contract and delete-account actions from the chunk state witness.
-    /// Instead of sending code in the witness, the code checks the code-size using the internal trie nodes.
-    ExcludeExistingCodeFromWitnessForCodeLen,
 }
 
 impl ProtocolFeature {
@@ -250,7 +230,6 @@ impl ProtocolFeature {
             | ProtocolFeature::ChunkEndorsementV2
             | ProtocolFeature::ChunkEndorsementsInBlockHeader
             | ProtocolFeature::StateStoredReceipt => 72,
-            ProtocolFeature::ExcludeContractCodeFromStateWitness => 73,
 
             // This protocol version is reserved for use in resharding tests. An extra resharding
             // is simulated on top of the latest shard layout in production. Note that later
@@ -269,13 +248,6 @@ impl ProtocolFeature {
             // TODO(#11201): When stabilizing this feature in mainnet, also remove the temporary code
             // that always enables this for mocknet (see config_mocknet function).
             ProtocolFeature::ShuffleShardAssignments => 143,
-            ProtocolFeature::CurrentEpochStateSync => 144,
-            ProtocolFeature::SimpleNightshadeV4 => 145,
-            #[cfg(feature = "protocol_feature_relaxed_chunk_validation")]
-            ProtocolFeature::RelaxedChunkValidation => 146,
-            ProtocolFeature::ExcludeExistingCodeFromWitnessForCodeLen => 147,
-            ProtocolFeature::BandwidthScheduler => 148,
-            // Place features that are not yet in Nightly below this line.
         }
     }
 
@@ -285,10 +257,10 @@ impl ProtocolFeature {
 }
 
 /// Current protocol version used on the mainnet with all stable features.
-const STABLE_PROTOCOL_VERSION: ProtocolVersion = 73;
+const STABLE_PROTOCOL_VERSION: ProtocolVersion = 72;
 
 // On nightly, pick big enough version to support all features.
-const NIGHTLY_PROTOCOL_VERSION: ProtocolVersion = 148;
+const NIGHTLY_PROTOCOL_VERSION: ProtocolVersion = 145;
 
 /// Largest protocol version supported by the current binary.
 pub const PROTOCOL_VERSION: ProtocolVersion = if cfg!(feature = "nightly_protocol") {

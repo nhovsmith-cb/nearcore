@@ -35,9 +35,8 @@ impl StorageMutator {
         &mut self,
         account_id: &AccountId,
     ) -> anyhow::Result<&mut SingleShardStorageMutator> {
-        let shard_info =
-            self.epoch_manager.account_id_to_shard_info(&account_id, &self.epoch_id)?;
-        Ok(&mut self.mutators[shard_info.shard_index])
+        let shard_id = self.epoch_manager.account_id_to_shard_id(&account_id, &self.epoch_id)?;
+        Ok(&mut self.mutators[shard_id as usize])
     }
 
     pub(crate) fn set_account(

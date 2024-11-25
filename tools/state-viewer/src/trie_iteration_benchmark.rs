@@ -8,7 +8,6 @@ use near_primitives::trie_key::trie_key_parsers::{
     parse_account_id_from_access_key_key, parse_account_id_from_trie_key_with_separator,
 };
 use near_primitives_core::types::ShardId;
-use near_store::adapter::StoreAdapter;
 use near_store::{ShardUId, Store, Trie, TrieDBStorage};
 use nearcore::NearConfig;
 use std::cell::RefCell;
@@ -117,15 +116,14 @@ impl TrieIterationBenchmarkCmd {
             EpochManager::new_from_genesis_config(store.clone(), &genesis_config).unwrap();
         let shard_layout = epoch_manager.get_shard_layout(block.header().epoch_id()).unwrap();
 
-        for (shard_index, chunk_header) in block.chunks().iter_deprecated().enumerate() {
-            let shard_id = shard_layout.get_shard_id(shard_index).unwrap();
+        for (shard_id, chunk_header) in block.chunks().iter().enumerate() {
             if chunk_header.height_included() != block.header().height() {
                 println!("chunk for shard {shard_id} is missing and will be skipped");
             }
         }
 
-        for (shard_index, chunk_header) in block.chunks().iter_deprecated().enumerate() {
-            let shard_id = shard_layout.get_shard_id(shard_index).unwrap();
+        for (shard_id, chunk_header) in block.chunks().iter().enumerate() {
+            let shard_id = shard_id as ShardId;
             if chunk_header.height_included() != block.header().height() {
                 println!("chunk for shard {shard_id} is missing, skipping it");
                 continue;
@@ -150,7 +148,7 @@ impl TrieIterationBenchmarkCmd {
         // corresponds to the current epoch id. In practice shouldn't
         // matter as the shard layout doesn't change.
         let state_root = chunk_header.prev_state_root();
-        let storage = TrieDBStorage::new(store.trie_store(), shard_uid);
+        let storage = TrieDBStorage::new(store.clone(), shard_uid);
         let flat_storage_chunk_view = None;
         Trie::new(Arc::new(storage), state_root, flat_storage_chunk_view)
     }

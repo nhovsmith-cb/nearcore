@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
 
 #[test]
-fn slow_test_in_memory_trie_node_consistency() {
+fn test_in_memory_trie_node_consistency() {
     // Recommended to run with RUST_LOG=memtrie=debug,chunks=error,info
     init_test_logger();
     let initial_balance = 10000 * ONE_NEAR;
@@ -67,7 +67,7 @@ fn slow_test_in_memory_trie_node_consistency() {
     for account in &accounts {
         genesis_builder.add_user_account_simple(account.clone(), initial_balance);
     }
-    let (genesis, _) = genesis_builder.build();
+    let genesis = genesis_builder.build();
 
     // Create two stores, one for each node. We'll be reusing the stores later
     // to emulate node restarts.
@@ -227,7 +227,7 @@ fn get_block_producer(env: &TestEnv, head: &Tip, height_offset: u64) -> AccountI
 }
 
 fn check_block_does_not_have_missing_chunks(block: &Block) {
-    for chunk in block.chunks().iter_deprecated() {
+    for chunk in block.chunks().iter() {
         if !chunk.is_new_chunk(block.header().height()) {
             panic!(
                 "Block at height {} is produced without all chunks; the test setup is faulty",
@@ -356,7 +356,7 @@ fn run_chain_for_some_blocks_while_sending_money_around(
             }
         }
 
-        for chunk in block_processed.chunks().iter_deprecated() {
+        for chunk in block_processed.chunks().iter() {
             let mut chunks_found = 0;
             for i in 0..env.clients.len() {
                 let client = &env.clients[i];
@@ -474,12 +474,12 @@ fn test_in_memory_trie_consistency_with_state_sync_base_case(track_all_shards: b
     for account in &accounts {
         genesis_builder.add_user_account_simple(account.clone(), initial_balance);
     }
-    let (genesis, epoch_config_store) = genesis_builder.build();
+    let genesis = genesis_builder.build();
+
     let stores = (0..NUM_VALIDATORS).map(|_| create_test_store()).collect::<Vec<_>>();
     let mut env = TestEnv::builder(&genesis.config)
         .clock(clock.clock())
         .clients((0..NUM_VALIDATORS).map(|i| format!("account{}", i).parse().unwrap()).collect())
-        .epoch_config_store(epoch_config_store)
         .stores(stores)
         .maybe_track_all_shards(track_all_shards)
         .nightshade_runtimes_with_trie_config(
@@ -527,11 +527,11 @@ fn test_in_memory_trie_consistency_with_state_sync_base_case(track_all_shards: b
 }
 
 #[test]
-fn slow_test_in_memory_trie_consistency_with_state_sync_base_case_track_single_shard() {
+fn test_in_memory_trie_consistency_with_state_sync_base_case_track_single_shard() {
     test_in_memory_trie_consistency_with_state_sync_base_case(false);
 }
 
 #[test]
-fn slow_test_in_memory_trie_consistency_with_state_sync_base_case_track_all_shards() {
+fn test_in_memory_trie_consistency_with_state_sync_base_case_track_all_shards() {
     test_in_memory_trie_consistency_with_state_sync_base_case(true);
 }

@@ -42,11 +42,13 @@ implicitly set.
 The `expensive` tests run a test binary and execute specific test in
 it.  (Test binaries are those built via `cargo test --no-run`).  While
 this can be used to run any Rust test, the intention is to run
-expensive tests only.  Those are the tests which are normally ignored unless
-their name is prefixed with `ultra_slow_test` like so:
+expensive tests only.  Those are the tests which are ignored unless
+`expensive_tests` crate feature is enabled.  Such tests should be
+marked with a `cfg_attr` macro, e.g.:
 
     #[test]
-    fn ultra_slow_test_gc_boundaries_large() {
+    #[cfg_attr(not(feature = "expensive_tests"), ignore)]
+    fn test_gc_boundaries_large() {
         /* ... */
     }
 
@@ -54,7 +56,7 @@ The arguments of an expensive test specify package in which the test
 is defined, test binary name and the full path to the test function.
 For example:
 
-    expensive nearcore test_tps_regression test::ultra_slow_test_highload
+    expensive nearcore test_tps_regression test::test_highload
 
 (Currently the package name is ignored but it may change in the future
 so make sure it’s set correctly).  The path to the test function must
@@ -155,11 +157,13 @@ run can take over an hour to finish.
 New tests can be created either as a Rust test or a pytest.
 
 If a Rust test is long-running (or otherwise requires a lot of
-resources) and intended to be run as a nightly test on NayDuck it's
-name should be marked prefixed with `ultra_slow_test`.  With that, the
-tests will not be part of a `cargo test` run performed on every
-commit, but NayDuck will be able to execute them. Apart from that,
-expensive Rust tests work exactly the same as any other Rust tests.
+resources) and intended to be run as a nightly test on NayDuck it
+should be marked with a `#[cfg(feature = "expensive_tests")]`
+directive (either on the test function or module containing it).  With
+that, the tests will not be part of a `cargo test` run performed on
+every commit, but NayDuck will be able to execute them.  Apart from
+that, expensive Rust tests work exactly the same as any other Rust
+tests.
 
 pytests are defined as scripts in the `pytest/tests` directory.  As
 previously mentioned, even though the directory is called pytest, when

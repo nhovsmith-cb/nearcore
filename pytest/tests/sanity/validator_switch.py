@@ -26,7 +26,8 @@ nodes = start_cluster(
     [["epoch_length", EPOCH_LENGTH], ["block_producer_kickout_threshold", 10],
      ["chunk_producer_kickout_threshold", 10]], {3: tracked_shards})
 
-utils.wait_for_blocks(nodes[0], target=5)
+time.sleep(3)
+
 hash_ = nodes[0].get_latest_block().hash_bytes
 
 for i in range(4):

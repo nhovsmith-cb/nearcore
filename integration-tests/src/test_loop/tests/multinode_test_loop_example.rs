@@ -13,7 +13,7 @@ use crate::test_loop::utils::ONE_NEAR;
 const NUM_CLIENTS: usize = 4;
 
 #[test]
-fn slow_test_client_with_multi_test_loop() {
+fn test_client_with_multi_test_loop() {
     init_test_logger();
     let builder = TestLoopBuilder::new();
 
@@ -37,10 +37,10 @@ fn slow_test_client_with_multi_test_loop() {
     for account in &accounts {
         genesis_builder.add_user_account_simple(account.clone(), initial_balance);
     }
-    let (genesis, epoch_config_store) = genesis_builder.build();
+    let genesis = genesis_builder.build();
 
     let TestLoopEnv { mut test_loop, datas: node_datas, tempdir } =
-        builder.genesis(genesis).epoch_config_store(epoch_config_store).clients(clients).build();
+        builder.genesis(genesis).clients(clients).build();
 
     let first_epoch_tracked_shards = {
         let clients = node_datas
@@ -51,7 +51,7 @@ fn slow_test_client_with_multi_test_loop() {
     };
     tracing::info!("First epoch tracked shards: {:?}", first_epoch_tracked_shards);
 
-    execute_money_transfers(&mut test_loop, &node_datas, &accounts).unwrap();
+    execute_money_transfers(&mut test_loop, &node_datas, &accounts);
 
     // Make sure the chain progresses for several epochs.
     let client_handle = node_datas[0].client_sender.actor_handle();

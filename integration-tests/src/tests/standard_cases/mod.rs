@@ -25,7 +25,7 @@ use near_store::trie::TrieNodesCount;
 use std::sync::Arc;
 
 use crate::node::Node;
-use crate::user::{CommitError, User};
+use crate::user::User;
 use near_parameters::{RuntimeConfig, RuntimeConfigStore};
 use near_primitives::receipt::{ActionReceipt, Receipt, ReceiptEnum, ReceiptV0};
 use near_primitives::test_utils;
@@ -251,8 +251,11 @@ pub fn test_nonce_update_when_deploying_contract(node: impl Node) {
 pub fn test_nonce_updated_when_tx_failed(node: impl Node) {
     let account_id = &node.account_id().unwrap();
     let node_user = node.user();
+    let root = node_user.get_state_root();
     node_user.send_money(account_id.clone(), bob_account(), TESTING_INIT_BALANCE + 1).unwrap_err();
     assert_eq!(node_user.get_access_key_nonce_for_signer(account_id).unwrap(), 0);
+    let new_root = node_user.get_state_root();
+    assert_eq!(root, new_root);
 }
 
 pub fn test_upload_contract(node: impl Node) {
@@ -495,8 +498,11 @@ pub fn test_smart_contract_reward(node: impl Node) {
 pub fn test_send_money_over_balance(node: impl Node) {
     let account_id = &node.account_id().unwrap();
     let node_user = node.user();
+    let root = node_user.get_state_root();
     let money_used = TESTING_INIT_BALANCE + 1;
     node_user.send_money(account_id.clone(), bob_account(), money_used).unwrap_err();
+    let new_root = node_user.get_state_root();
+    assert_eq!(root, new_root);
     let result1 = node_user.view_account(account_id).unwrap();
     assert_eq!(
         (result1.amount, result1.locked),
@@ -841,13 +847,13 @@ pub fn test_delete_key_last(node: impl Node) {
             // forget the nonce when we delete a key!
             assert_eq!(
                 err,
-                CommitError::Server(ServerError::TxExecutionError(
-                    TxExecutionError::InvalidTxError(InvalidTxError::InvalidAccessKeyError(
+                ServerError::TxExecutionError(TxExecutionError::InvalidTxError(
+                    InvalidTxError::InvalidAccessKeyError(
                         InvalidAccessKeyError::AccessKeyNotFound {
                             account_id: account_id.clone(),
                             public_key: node.signer().public_key().into(),
                         },
-                    ))
+                    )
                 ))
             )
         }
@@ -1058,18 +1064,14 @@ pub fn test_access_key_smart_contract_reject_method_name(node: impl Node) {
     let transaction_result = node_user
         .function_call(account_id.clone(), bob_account(), "run_test", vec![], 10u64.pow(14), 0)
         .unwrap_err();
-    if cfg!(feature = "protocol_feature_relaxed_chunk_validation") {
-        assert_eq!(transaction_result, CommitError::OutcomeNotFound);
-    } else {
-        assert_eq!(
-            transaction_result,
-            CommitError::Server(ServerError::TxExecutionError(TxExecutionError::InvalidTxError(
-                InvalidTxError::InvalidAccessKeyError(InvalidAccessKeyError::MethodNameMismatch {
-                    method_name: "run_test".to_string()
-                })
-            )))
-        );
-    }
+    assert_eq!(
+        transaction_result,
+        ServerError::TxExecutionError(TxExecutionError::InvalidTxError(
+            InvalidTxError::InvalidAccessKeyError(InvalidAccessKeyError::MethodNameMismatch {
+                method_name: "run_test".to_string()
+            })
+        ))
+    );
 }
 
 pub fn test_access_key_smart_contract_reject_contract_id(node: impl Node) {
@@ -1097,19 +1099,15 @@ pub fn test_access_key_smart_contract_reject_contract_id(node: impl Node) {
             0,
         )
         .unwrap_err();
-    if cfg!(feature = "protocol_feature_relaxed_chunk_validation") {
-        assert_eq!(transaction_result, CommitError::OutcomeNotFound);
-    } else {
-        assert_eq!(
-            transaction_result,
-            CommitError::Server(ServerError::TxExecutionError(TxExecutionError::InvalidTxError(
-                InvalidTxError::InvalidAccessKeyError(InvalidAccessKeyError::ReceiverMismatch {
-                    tx_receiver: eve_dot_alice_account(),
-                    ak_receiver: bob_account().into()
-                })
-            )))
-        );
-    }
+    assert_eq!(
+        transaction_result,
+        ServerError::TxExecutionError(TxExecutionError::InvalidTxError(
+            InvalidTxError::InvalidAccessKeyError(InvalidAccessKeyError::ReceiverMismatch {
+                tx_receiver: eve_dot_alice_account(),
+                ak_receiver: bob_account().into()
+            })
+        ))
+    );
 }
 
 pub fn test_access_key_reject_non_function_call(node: impl Node) {
@@ -1129,16 +1127,12 @@ pub fn test_access_key_reject_non_function_call(node: impl Node) {
 
     let transaction_result =
         node_user.delete_key(account_id.clone(), node.signer().public_key()).unwrap_err();
-    if cfg!(feature = "protocol_feature_relaxed_chunk_validation") {
-        assert_eq!(transaction_result, CommitError::OutcomeNotFound);
-    } else {
-        assert_eq!(
-            transaction_result,
-            CommitError::Server(ServerError::TxExecutionError(TxExecutionError::InvalidTxError(
-                InvalidTxError::InvalidAccessKeyError(InvalidAccessKeyError::RequiresFullAccess)
-            )))
-        );
-    }
+    assert_eq!(
+        transaction_result,
+        ServerError::TxExecutionError(TxExecutionError::InvalidTxError(
+            InvalidTxError::InvalidAccessKeyError(InvalidAccessKeyError::RequiresFullAccess)
+        ))
+    );
 }
 
 pub fn test_increase_stake(node: impl Node) {

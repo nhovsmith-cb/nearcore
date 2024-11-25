@@ -30,6 +30,7 @@ pub mod delta;
 mod manager;
 mod metrics;
 mod storage;
+pub mod store_helper;
 #[cfg(test)]
 pub mod test_utils;
 mod types;
@@ -41,7 +42,7 @@ pub use metrics::FlatStorageCreationMetrics;
 pub use storage::FlatStorage;
 pub use types::{
     BlockInfo, FetchingStateStatus, FlatStateIterator, FlatStorageCreationStatus, FlatStorageError,
-    FlatStorageReadyStatus, FlatStorageReshardingStatus, FlatStorageStatus, ParentSplitParameters,
+    FlatStorageReadyStatus, FlatStorageStatus,
 };
 
 pub(crate) const POISONED_LOCK_ERR: &str = "The lock was poisoned.";

@@ -8,7 +8,6 @@ use near_primitives::block::Block;
 use near_primitives::hash::CryptoHash;
 use near_primitives::shard_layout::ShardUId;
 use near_primitives::transaction::SignedTransaction;
-use near_store::adapter::StoreAdapter;
 use near_store::config::StateSnapshotType;
 use near_store::flat::FlatStorageManager;
 use near_store::{
@@ -43,7 +42,7 @@ impl StateSnaptshotTestEnv {
             view_shard_cache_config: trie_cache_config,
             ..TrieConfig::default()
         };
-        let flat_storage_manager = FlatStorageManager::new(store.flat_store());
+        let flat_storage_manager = FlatStorageManager::new(store.clone());
         let shard_uids = [ShardUId::single_shard()];
         let state_snapshot_config = StateSnapshotConfig {
             state_snapshot_type: StateSnapshotType::EveryEpoch,
@@ -52,7 +51,7 @@ impl StateSnaptshotTestEnv {
             state_snapshot_subdir: state_snapshot_subdir.clone(),
         };
         let shard_tries = ShardTries::new(
-            store.trie_store(),
+            store.clone(),
             trie_config,
             &shard_uids,
             flat_storage_manager,
@@ -77,7 +76,7 @@ fn test_maybe_open_state_snapshot_no_state_snapshot_key_entry() {
     let store = create_test_store();
     let test_env = set_up_test_env_for_state_snapshots(&store);
     let result =
-        test_env.shard_tries.maybe_open_state_snapshot(|_| Ok(vec![(0, ShardUId::single_shard())]));
+        test_env.shard_tries.maybe_open_state_snapshot(|_| Ok(vec![ShardUId::single_shard()]));
     assert!(result.is_err());
 }
 
@@ -88,11 +87,9 @@ fn test_maybe_open_state_snapshot_file_not_exist() {
     let store = create_test_store();
     let test_env = set_up_test_env_for_state_snapshots(&store);
     let snapshot_hash = CryptoHash::new();
-    let mut store_update = test_env.shard_tries.store_update();
-    store_update.set_state_snapshot_hash(Some(snapshot_hash));
-    store_update.commit().unwrap();
+    test_env.shard_tries.set_state_snapshot_hash(Some(snapshot_hash)).unwrap();
     let result =
-        test_env.shard_tries.maybe_open_state_snapshot(|_| Ok(vec![(0, ShardUId::single_shard())]));
+        test_env.shard_tries.maybe_open_state_snapshot(|_| Ok(vec![ShardUId::single_shard()]));
     assert!(result.is_err());
 }
 
@@ -106,9 +103,7 @@ fn test_maybe_open_state_snapshot_garbage_snapshot() {
     let store = create_test_store();
     let test_env = set_up_test_env_for_state_snapshots(&store);
     let snapshot_hash = CryptoHash::new();
-    let mut store_update = test_env.shard_tries.store_update();
-    store_update.set_state_snapshot_hash(Some(snapshot_hash));
-    store_update.commit().unwrap();
+    test_env.shard_tries.set_state_snapshot_hash(Some(snapshot_hash)).unwrap();
     let snapshot_path = ShardTries::get_state_snapshot_base_dir(
         &snapshot_hash,
         &test_env.home_dir,
@@ -124,7 +119,7 @@ fn test_maybe_open_state_snapshot_garbage_snapshot() {
     file.write_all(&data).unwrap();
 
     let result =
-        test_env.shard_tries.maybe_open_state_snapshot(|_| Ok(vec![(0, ShardUId::single_shard())]));
+        test_env.shard_tries.maybe_open_state_snapshot(|_| Ok(vec![ShardUId::single_shard()]));
     assert!(result.is_err());
 }
 
@@ -136,7 +131,7 @@ fn verify_make_snapshot(
     state_snapshot_test_env.shard_tries.delete_state_snapshot();
     state_snapshot_test_env.shard_tries.create_state_snapshot(
         block_hash,
-        &[(0, ShardUId::single_shard())],
+        &[ShardUId::single_shard()],
         block,
     )?;
     // check that make_state_snapshot does not panic or err out
@@ -150,10 +145,9 @@ fn verify_make_snapshot(
     // check that the snapshot just made can be opened
     state_snapshot_test_env
         .shard_tries
-        .maybe_open_state_snapshot(|_| Ok(vec![(0, ShardUId::single_shard())]))?;
+        .maybe_open_state_snapshot(|_| Ok(vec![ShardUId::single_shard()]))?;
     // check that the entry of STATE_SNAPSHOT_KEY is the latest block hash
-    let db_state_snapshot_hash =
-        state_snapshot_test_env.shard_tries.store().get_state_snapshot_hash()?;
+    let db_state_snapshot_hash = state_snapshot_test_env.shard_tries.get_state_snapshot_hash()?;
     if db_state_snapshot_hash != block_hash {
         return Err(anyhow::Error::msg(
             "the entry of STATE_SNAPSHOT_KEY does not equal to the prev block hash",
@@ -190,7 +184,7 @@ fn delete_content_at_path(path: &str) -> std::io::Result<()> {
 // Runs a validator node.
 // Makes a state snapshot after processing every block. Each block contains a
 // transaction creating an account.
-fn slow_test_make_state_snapshot() {
+fn test_make_state_snapshot() {
     init_test_logger();
     let genesis = Genesis::test(vec!["test0".parse().unwrap()], 1);
     let mut env = TestEnv::builder(&genesis.config)
@@ -233,9 +227,7 @@ fn slow_test_make_state_snapshot() {
     }
 
     // check that if the entry in DBCol::STATE_SNAPSHOT_KEY was missing while snapshot file exists, an overwrite of snapshot can succeed
-    let mut store_update = state_snapshot_test_env.shard_tries.store_update();
-    store_update.set_state_snapshot_hash(None);
-    store_update.commit().unwrap();
+    state_snapshot_test_env.shard_tries.set_state_snapshot_hash(None).unwrap();
     let head = env.clients[0].chain.head().unwrap();
     let head_block_hash = head.last_block_hash;
     let head_block = env.clients[0].chain.get_block(&head_block_hash).unwrap();

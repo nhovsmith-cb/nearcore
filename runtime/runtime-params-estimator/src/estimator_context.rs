@@ -6,8 +6,6 @@ use genesis_populate::get_account_id;
 use genesis_populate::state_dump::StateDump;
 use near_parameters::config::CongestionControlConfig;
 use near_parameters::{ExtCosts, RuntimeConfigStore};
-use near_primitives::apply::ApplyChunkReason;
-use near_primitives::bandwidth_scheduler::BlockBandwidthRequests;
 use near_primitives::congestion_info::{BlockCongestionInfo, ExtendedCongestionInfo};
 use near_primitives::hash::CryptoHash;
 use near_primitives::receipt::Receipt;
@@ -17,9 +15,8 @@ use near_primitives::test_utils::MockEpochInfoProvider;
 use near_primitives::transaction::{ExecutionStatus, SignedTransaction};
 use near_primitives::types::{Gas, MerkleHash};
 use near_primitives::version::{ProtocolFeature, PROTOCOL_VERSION};
-use near_store::adapter::{StoreAdapter, StoreUpdateAdapter};
 use near_store::flat::{
-    BlockInfo, FlatStateChanges, FlatStateDelta, FlatStateDeltaMetadata, FlatStorage,
+    store_helper, BlockInfo, FlatStateChanges, FlatStateDelta, FlatStateDeltaMetadata, FlatStorage,
     FlatStorageManager, FlatStorageReadyStatus, FlatStorageStatus,
 };
 use near_store::{ShardTries, ShardUId, StateSnapshotConfig, TrieUpdate};
@@ -80,10 +77,10 @@ impl<'c> EstimatorContext<'c> {
         let root = roots[0];
 
         let shard_uid = ShardUId::single_shard();
-        let flat_store = store.flat_store();
-        let flat_storage_manager = FlatStorageManager::new(flat_store.clone());
-        let mut store_update = flat_store.store_update();
-        store_update.set_flat_storage_status(
+        let flat_storage_manager = FlatStorageManager::new(store.clone());
+        let mut store_update = store.store_update();
+        store_helper::set_flat_storage_status(
+            &mut store_update,
             shard_uid,
             FlatStorageStatus::Ready(FlatStorageReadyStatus {
                 flat_head: BlockInfo::genesis(CryptoHash::hash_borsh(0usize), 0),
@@ -102,7 +99,7 @@ impl<'c> EstimatorContext<'c> {
             trie_config.load_mem_tries_for_shards = vec![shard_uid];
         }
         let tries = ShardTries::new(
-            store.trie_store(),
+            store,
             trie_config,
             &[shard_uid],
             flat_storage_manager,
@@ -172,7 +169,7 @@ impl<'c> EstimatorContext<'c> {
         let congestion_info = BlockCongestionInfo::new(congestion_info);
 
         ApplyState {
-            apply_reason: ApplyChunkReason::UpdateTrackedShard,
+            apply_reason: None,
             // Put each runtime into a separate shard.
             block_height: 1,
             // Epoch length is long enough to avoid corner cases.
@@ -192,7 +189,6 @@ impl<'c> EstimatorContext<'c> {
             migration_data: Arc::new(MigrationData::default()),
             migration_flags: MigrationFlags::default(),
             congestion_info,
-            bandwidth_requests: BlockBandwidthRequests::empty(),
         }
     }
 
@@ -313,7 +309,7 @@ impl Testbed<'_> {
     }
 
     pub(crate) fn trie_caching_storage(&mut self) -> TrieCachingStorage {
-        let store = self.tries.store();
+        let store = self.tries.get_store();
         let is_view = false;
         let prefetcher = None;
         let caching_storage = TrieCachingStorage::new(
@@ -328,7 +324,7 @@ impl Testbed<'_> {
 
     pub(crate) fn clear_caches(&mut self) {
         // Flush out writes hanging in memtable
-        self.tries.store().store().flush().unwrap();
+        self.tries.get_store().flush().unwrap();
 
         // OS caches:
         // - only required in time based measurements, since ICount looks at syscalls directly.
@@ -362,8 +358,7 @@ impl Testbed<'_> {
             )
             .unwrap();
 
-        let store = self.tries.store();
-        let mut store_update = store.store_update();
+        let mut store_update = self.tries.store_update();
         let shard_uid = ShardUId::single_shard();
         self.root = self.tries.apply_all(&apply_result.trie_changes, shard_uid, &mut store_update);
         if self.config.memtrie {
@@ -380,7 +375,7 @@ impl Testbed<'_> {
             assert_eq!(self.root, memtrie_root);
         }
         near_store::flat::FlatStateChanges::from_state_changes(&apply_result.state_changes)
-            .apply_to_flat_state(&mut store_update.flat_store_update(), shard_uid);
+            .apply_to_flat_state(&mut store_update, shard_uid);
         store_update.commit().unwrap();
         self.apply_state.block_height += 1;
         if let Some(congestion_info) = apply_result.congestion_info {

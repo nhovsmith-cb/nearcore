@@ -57,9 +57,7 @@ impl RpcFrom<GetChunkError> for RpcChunkError {
         match error {
             GetChunkError::IOError { error_message } => Self::InternalError { error_message },
             GetChunkError::UnknownBlock { error_message } => Self::UnknownBlock { error_message },
-            GetChunkError::InvalidShardId { shard_id } => {
-                Self::InvalidShardId { shard_id: shard_id.into() }
-            }
+            GetChunkError::InvalidShardId { shard_id } => Self::InvalidShardId { shard_id },
             GetChunkError::UnknownChunk { chunk_hash } => Self::UnknownChunk { chunk_hash },
             GetChunkError::Unreachable { ref error_message } => {
                 tracing::warn!(target: "jsonrpc", "Unreachable error occurred: {}", error_message);
